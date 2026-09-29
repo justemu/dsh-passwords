@@ -2,7 +2,7 @@
 // 否则相对模块位置解析项目根目录 .env。
 // 这样无论从哪个目录运行（systemd WorkingDirectory、npm start、
 // 任意目录下的 CLI）都读到同一份配置与同一把密钥。
-import { config as loadEnv } from 'dotenv';
+import { config as loadEnv, parse as parseEnv } from 'dotenv';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomBytes } from 'node:crypto';
 import { chmodSync, existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
@@ -17,13 +17,56 @@ const explicitEnvFile = process.env.DSH_PASSWORDS_ENV_FILE?.trim();
 const configRoot = explicitEnvFile ? path.dirname(path.resolve(explicitEnvFile)) : path.resolve(moduleDir, '..');
 if (explicitEnvFile) {
   loadEnv({ path: explicitEnvFile, quiet: true });
+} else {
+  loadEnv({ path: path.join(moduleDir, '..', '.env'), quiet: true });
 }
-loadEnv({ path: path.join(moduleDir, '..', '.env'), quiet: true });
 
+// 插件拉起的网关子进程与插件初始快照共享部署文件：这些键必须以文件为准，
+// 不能被 dsh 常驻进程继承下来的陈旧值覆盖。IP/端口/上游 TLS 校验开关、设置文件锚点
+// 和 bindAll 补丁开关都直接影响认证面与网络暴露，遗漏会造成插件与网关撕裂。
+const MANAGED_ENV_KEYS = [
+  'SETUP_KEY', 'MCP_DB_PATH', 'MCP_DB_ENC_KEY', 'MCP_JWT_SECRET', 'MCP_INTERNAL_SECRET',
+  'MCP_DSH_ROOT', 'MCP_DSH_RESTART_SERVICE', 'MCP_DSH_AUTO_UPDATE', 'MCP_DSH_UPDATE_MAX_BPS',
+  'MCP_DSH_SETTINGS_FILE', 'MCP_DSH_PATCH_ALLOW_BIND_ALL',
+  'MCP_GATEWAY_PORT', 'MCP_GATEWAY_HOST', 'MCP_GATEWAY_UPSTREAM', 'MCP_GATEWAY_AUTO_TLS',
+  'MCP_GATEWAY_TLS_CERT', 'MCP_GATEWAY_TLS_KEY', 'MCP_GATEWAY_DOMAIN', 'MCP_GATEWAY_PUBLIC_HOST',
+  'MCP_GATEWAY_REDIRECT_PORT', 'MCP_GATEWAY_ACME_EMAIL', 'MCP_GATEWAY_ACME_STAGING',
+  'MCP_GATEWAY_UPSTREAM_TLS_VERIFY', 'MCP_GATEWAY_SSH_ENDPOINTS',
+] as const;
+const managedFileKeys = new Map<string, Set<string>>();
 
+/** 原生插件与它拉起的子进程共享部署文件快照；Docker 和直接运行 CLI 保持环境变量优先。 */
+export function deploymentGatewayEnv(envFile: string, inherited: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env = { ...inherited };
+  if (env.DSH_PASSWORDS_RUNTIME?.trim().toLowerCase() === 'docker') return env;
+  const file = path.resolve(envFile);
+  if (!existsSync(file)) {
+    if (managedFileKeys.has(file)) throw new Error('部署环境文件已缺失，请恢复后重启 DeepSeek Harness');
+    return env;
+  }
+  const values = parseEnv(readFileSync(file));
+  let fileKeys = managedFileKeys.get(file);
+  if (fileKeys === undefined) {
+    fileKeys = new Set<string>();
+    managedFileKeys.set(file, fileKeys);
+  }
+  for (const name of MANAGED_ENV_KEYS) {
+    if (Object.hasOwn(values, name)) {
+      env[name] = values[name];
+      fileKeys.add(name);
+    } else if (fileKeys.has(name)) {
+      delete env[name];
+    }
+  }
+  return env;
+}
 
-function readEnv(name: string, fallback: string): string {
-  return (process.env[name] ?? '').trim() || fallback;
+if (explicitEnvFile && process.env.DSH_GATEWAY_PARENT_PID?.trim() && existsSync(explicitEnvFile) &&
+    process.env.DSH_PASSWORDS_RUNTIME?.trim().toLowerCase() !== 'docker') {
+  const values = parseEnv(readFileSync(explicitEnvFile));
+  for (const name of MANAGED_ENV_KEYS) {
+    if (Object.hasOwn(values, name)) process.env[name] = values[name];
+  }
 }
 
 /** 环境文件明确指定时，配置相对路径必须以环境文件目录为锚点。 */
@@ -70,32 +113,18 @@ export interface PlatformConfig {
     restartService: string;
   };
   /**
-   * 第三方端点登记表（一条变量管两条通道与两种能力：
-   * MCP_GATEWAY_SSH_ENDPOINTS）。
-   *
-   * 规则语法：`[owner:][ws:|http:]路径`（前缀可省略、顺序任意）。
-   *   - owner: 仅主用户（子用户两条通道一律 403）；
-   *   - 其余规则：子用户需勾选 allow_ssh（「已登记」+「已勾选」两把钥匙）；
-   *   - ws: / http: 限定通道；不写 = 两条通道都放行。
-   * 路径为精确匹配，或尾部 `/*` 只匹配其直接子路径。不做任何插件专属自动探测
-   * （网关是独立进程，看不到宿主注册了哪些路由）。已登记端点中 body 带 host
-   * 字段的 HTTP 写请求仍会做私网/回环 SSRF 判定。
+   * 第三方端点登记表：动态发现的 DSH 插件 Remote/API 面不需要逐条登记；
+   * 该表只保留无法由宿主运行时登记的传统 HTTP/WS 端点和 owner-only 面。
    */
   endpointRules: string[];
-  /**
-   * 第三方插件兼容层开关（MCP_GATEWAY_PLUGIN_COMPAT）。默认 off：
-   *   off —— 网关对第三方插件保持通用姿态：未登记的第三方路径（含根级插件
-   *          路由）对子用户一律 fail-closed；放行只走端点登记表。
-   *   on  —— 额外启用已知插件的细粒度适配（文件树白名单 / 上传下载门控 /
-   *          内容清洗；见 plugin-compat.ts）。仅在对这些插件有依赖时开启。
-   */
-  pluginCompat: boolean;
 }
 
 /** 第三方端点登记表变量名。 */
 export const SSH_ENDPOINT_ENV = 'MCP_GATEWAY_SSH_ENDPOINTS';
 
-export function loadConfig(options: { requireSetupKey?: boolean } = {}): PlatformConfig {
+export function loadConfig(options: { requireSetupKey?: boolean; env?: NodeJS.ProcessEnv } = {}): PlatformConfig {
+  const env = options.env ?? process.env;
+  const readEnv = (name: string, fallback: string): string => (env[name] ?? '').trim() || fallback;
   // F-07：启动时收紧 .env 权限（POSIX 0600），防止同机其他用户/备份泄露密钥
   tightenEnvPerm(envFilePath());
   // Windows：手动创建/复制来的 .env 不经过安装器，这里启动时同样用 icacls 收紧
@@ -127,13 +156,13 @@ export function loadConfig(options: { requireSetupKey?: boolean } = {}): Platfor
   // 可能不同，统一锚点避免各自打开一份数据库。
   const dbPathResolved = resolveConfigPath(dbPath, configRoot, path.join('data', 'platform.db'));
 
-  // MCP_DSH_RESTART_SERVICE 语义：未设置→默认 'dsh-web'；显式空值→不自动重启。
+  // MCP_DSH_RESTART_SERVICE：Windows 未设置时手动重启；其他平台默认 'dsh-web'；显式空值不自动重启。
   // （不能用 readEnv：它会把空值当未设置回退到默认，导致 Windows 上
   // 尝试 systemctl 报错。）
   const restartService =
-    process.env.MCP_DSH_RESTART_SERVICE !== undefined
-      ? process.env.MCP_DSH_RESTART_SERVICE.trim()
-      : 'dsh-web';
+    env.MCP_DSH_RESTART_SERVICE !== undefined
+      ? env.MCP_DSH_RESTART_SERVICE.trim()
+      : process.platform === 'win32' ? '' : 'dsh-web';
 
   // ── 自动 HTTPS（零配置 Let's Encrypt 证书） ────────────────────
   // 优先级：MCP_GATEWAY_DOMAIN（真实域名）> MCP_GATEWAY_PUBLIC_HOST
@@ -165,11 +194,8 @@ export function loadConfig(options: { requireSetupKey?: boolean } = {}): Platfor
       ? gatewayPortNum
       : 8080;
 
-  // 第三方端点登记表（唯一来源；旧变量/旧开关已清理，不再兼容读取）。
-  const endpointRules = parseEndpointAllowlist(process.env[SSH_ENDPOINT_ENV], SSH_ENDPOINT_ENV);
-  // 插件兼容层：默认关闭（通用 fail-closed 姿态）；仅显式 1/true/yes/on 打开。
-  const pluginCompatRaw = readEnv('MCP_GATEWAY_PLUGIN_COMPAT', '').trim().toLowerCase();
-  const pluginCompat = ['1', 'true', 'yes', 'on'].includes(pluginCompatRaw);
+  // 第三方端点登记表（唯一来源；代码不内置任何插件路径）。
+  const endpointRules = parseEndpointAllowlist(env[SSH_ENDPOINT_ENV], SSH_ENDPOINT_ENV);
 
   return {
     setupKey,
@@ -209,7 +235,6 @@ export function loadConfig(options: { requireSetupKey?: boolean } = {}): Platfor
     },
     // 端点登记表：HTTP 与 WebSocket 合并一条（代码不内置任何插件路径）。
     endpointRules,
-    pluginCompat,
   };
 }
 
@@ -225,10 +250,10 @@ export function activeEnvFilePath(): string {
 
 /** 端点运行态读取结果：ok=false 表示规则非法（调用方保留上次有效快照）。 */
 export type EndpointRuntimeRead =
-  | { ok: true; endpointRules: string[]; pluginCompat: boolean }
+  | { ok: true; endpointRules: string[] }
   | { ok: false; error: string };
 
-/**\n * 热更新读取：从部署环境文件解析端点运行态（登记表 + 兼容层开关）。\n *\n * 只读该文件；不修改 process.env，也不重复执行 loadConfig 的其它副作用\n * （权限收紧/密钥派生等）。返回：\n *   - null        文件不存在/不可读（保持现状，不报错）\n *   - {ok:false}  规则非法（调用方必须保留上次有效快照，并向支持者报错一次）\n *   - {ok:true}   解析成功，可直接应用\n *\n * 解析规则与 loadConfig 保持一致：dotenv 风味的引号/行尾注释剥离，再交给\n * parseEndpointAllowlist（非法输入 fail-closed 报错，不静默放宽）。\n */
+/**\n * 热更新读取：从部署环境文件解析端点运行态登记表。\n *\n * 只读该文件；不修改 process.env，也不重复执行 loadConfig 的其它副作用\n * （权限收紧/密钥派生等）。返回：\n *   - null        文件不存在/不可读（保持现状，不报错）\n *   - {ok:false}  规则非法（调用方必须保留上次有效快照，并向支持者报错一次）\n *   - {ok:true}   解析成功，可直接应用\n *\n * 解析规则与 loadConfig 保持一致：dotenv 风味的引号/行尾注释剥离，再交给\n * parseEndpointAllowlist（非法输入 fail-closed 报错，不静默放宽）。\n */
 export function readEndpointRuntimeConfig(envFile = envFilePath()): EndpointRuntimeRead | null {
   let raw: string;
   try {
@@ -245,8 +270,7 @@ export function readEndpointRuntimeConfig(envFile = envFilePath()): EndpointRunt
   }
   try {
     const endpointRules = parseEndpointAllowlist(values[SSH_ENDPOINT_ENV], SSH_ENDPOINT_ENV);
-    const compatRaw = (values.MCP_GATEWAY_PLUGIN_COMPAT ?? '').trim().toLowerCase();
-    return { ok: true, endpointRules, pluginCompat: ['1', 'true', 'yes', 'on'].includes(compatRaw) };
+    return { ok: true, endpointRules };
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }

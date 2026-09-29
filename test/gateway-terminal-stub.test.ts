@@ -1,9 +1,10 @@
-// 子用户 terminal UX 桩 + SSH 端点权限控制。
+// 子用户 terminal UX 桩 + SSH/owner 端点权限控制。
 //
-// 官方客户端会调用 terminal/list、environment、shells、close；子用户未获 SSH 权限时
-// 这四者回「不放开能力」的 server-response，避免 restore/setup 进入常驻重试；其余
-// terminal RPC 保持 fail-closed 403。主用户或已获 SSH 权限的子用户则透传官方 terminal
-// 的已知 HTTP RPC。terminal 仍保持硬拒绝分类，防止登记表绕过 gateway 的显式开关。
+// 官方客户端会调用 terminal/list、environment、shells、close；子用户始终没有宿主
+// terminal 能力，这四者回「不放开能力」的 server-response，避免 restore/setup 进入
+// 常驻重试；其余 terminal RPC 保持 fail-closed 403。旧 allowSsh 开关不再放行官方
+// terminal，也不放行登记在第三方登记表（MCP_GATEWAY_SSH_ENDPOINTS）中的 SSH/owner
+// 路由：子用户 HTTP/WS 一律拒绝；主用户不受影响，官方 terminal 与登记路由原样透传。
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
@@ -136,7 +137,6 @@ before(async () => {
     // 即使 terminal 路径被误写进第三方登记表，也必须由 allowSsh 的官方分支
     // 决定是否放行；这里不使用 owner: 规则，以便单独覆盖统一开关的开/关态。
     endpointRules: parseEndpointAllowlist('/api/terminal/*,ws:/api/terminal/*', 'TEST'),
-    pluginCompat: false,
   };
   const tokenFor = (user: { id: number; username: string }) =>
     `dsh_gateway_token=${jwt.sign({ sub: String(user.id), username: user.username, cv: 0 }, config.jwtSecret, { expiresIn: '12h' })}`;
@@ -180,7 +180,7 @@ test('子用户 terminal/list → 200 空成功（value 必须是裸数组，rpc
   assert.equal(upstreamHits.length, 0, '伪装响应不得到达上游');
 });
 
-test('allowSsh 关闭时，登记 /api/terminal/* 也不能放行子用户真实 terminal RPC', async () => {
+test('子用户真实 terminal RPC 一律 403（allowSsh 关闭）：登记 /api/terminal/* 也不放行', async () => {
   for (const method of ['create', 'follow', 'write', 'rename', 'resize', 'retain']) {
     upstreamHits = [];
     const res = await post(`/api/terminal/${method}`, envelope(`rpc-${method}`, `terminal/${method}`, { agentId: 'a' }), subuserCookie);
@@ -225,23 +225,45 @@ test('allowSsh 关闭时，子用户 terminal/close（点号/斜杠）→ 200 ok
   }
 });
 
-test('allowSsh 开启后，子用户全部官方 terminal HTTP unary RPC 透传到上游', async () => {
+test('旧 allowSsh 开关开启也不再放开子用户官方 terminal：四个无能力桩保持，其余方法 403，均不触上游', async () => {
   db.setPermissions(subuserId, {
     allowedFolders: [], hourlyTokenLimit: null, dailyMinutesLimit: null,
     allowUpload: false, allowGitDownload: false, allowWorkspaceCreate: false,
     allowSsh: true, banned: false, sandboxMode: null,
   });
   try {
-    const methods = ['environment', 'shells', 'list', 'create', 'write', 'resize', 'rename', 'close'] as const;
-    for (const method of methods) {
+    const stubCases = [
+      { method: 'list', url: '/api/terminal/list' },
+      { method: 'environment', url: '/api/terminal/environment' },
+      { method: 'shells', url: '/api/terminal/shells' },
+      { method: 'close', url: '/api/terminal/close' },
+    ] as const;
+    for (const { method, url } of stubCases) {
       upstreamHits = [];
-      upstreamBodies = [];
-      const body = envelope(`rpc-sub-${method}`, `terminal/${method}`, { agentId: 'agent-sub', id: 'term-sub' });
-      const res = await post(`/api/terminal/${method}`, body, subuserCookie);
-      assert.equal(res.status, 200, `allowSsh 开启后 terminal/${method} 必须透传：${res.body.slice(0, 160)}`);
-      assert.equal((res.json.result as { ok?: unknown } | undefined)?.ok, true);
-      assert.deepEqual(upstreamHits, [`/api/terminal/${method}`]);
-      assert.equal(upstreamBodies[0]?.body, JSON.stringify(body));
+      const res = await post(url, envelope(`rpc-ssh-on-${method}`, `terminal/${method}`, { sessionId: 'session-x', agentId: 'a' }), subuserCookie);
+      assert.equal(res.status, 200, `allowSsh 开启后 terminal/${method} 仍必须回无能力桩，而不是透传：${res.body.slice(0, 160)}`);
+      assert.equal(res.json.type, 'server-response');
+      assert.equal(res.json.rpcId, `rpc-ssh-on-${method}`, 'rpcId 必须逐字回显');
+      const result = res.json.result as { ok?: boolean; value?: unknown; error?: { code?: string } } | undefined;
+      if (method === 'list') {
+        assert.equal(result?.ok, true, 'list 仍是空成功桩');
+        assert.deepEqual(result?.value, [], 'value 必须是裸数组 []');
+      } else if (method === 'close') {
+        assert.equal(result?.ok, true, 'close 是幂等清理桩');
+        assert.equal(Object.hasOwn(result ?? {}, 'value'), false, 'close 结果不得包含 value');
+      } else {
+        assert.equal(result?.ok, false, `${method} 必须 ok=false`);
+        assert.equal(result?.error?.code, 'terminal/unavailable', `${method} 必须回固定错误码 terminal/unavailable`);
+      }
+      assert.equal(upstreamHits.length, 0, `allowSsh 开启后 terminal/${method} 仍不得触上游`);
+    }
+
+    // 真实宿主 shell 能力：allowSsh 开启也不得越权，一律 403。
+    for (const method of ['create', 'write', 'resize', 'rename', 'follow', 'retain'] as const) {
+      upstreamHits = [];
+      const res = await post(`/api/terminal/${method}`, envelope(`rpc-ssh-on-${method}`, `terminal/${method}`, { agentId: 'a' }), subuserCookie);
+      assert.equal(res.status, 403, `allowSsh 开启后 terminal/${method} 仍必须 403`);
+      assert.equal(upstreamHits.length, 0, `allowSsh 开启后 terminal/${method} 不得到达上游`);
     }
   } finally {
     db.setPermissions(subuserId, {

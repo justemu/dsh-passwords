@@ -48,10 +48,12 @@ import { Database, PermissionStateConflictError, SessionGrantsConflictError, can
 import {
   folderAllowed,
   normalizePath,
-  isWorkspaceRestricted,
-  isUploadRequest,
-  isGitRequest,
+  isSubuserBlockedApiPath,
   classifySubuserPath,
+  type DynamicPluginManifest,
+  OFFICIAL_API_NAMESPACES,
+  SUBUSER_BLOCKED_API_NAMESPACES,
+  isSubuserBlockedRemoteEndpoint,
   endpointAllowed,
   isWorkspaceWrite,
   isWorkspaceOrderWrite,
@@ -59,6 +61,8 @@ import {
   isWorkspaceDirectoryCreate,
   isWorkspaceDeleteOrRename,
   isDirectoryListRequest,
+  isUploadRequest,
+  isGitRequest,
   pathWithin,
   workspaceRegistrationAllowed,
   directoryEntryVisible,
@@ -94,12 +98,10 @@ import {
   clampSessionHistorySandbox,
   SANDBOX_RANK,
   isPrivateHost,
-  isDangerousUploadName,
   sanitizeText,
   sanitizeHiddenUnicode,
   todayLocal,
 } from './permissions.js';
-import { createPluginCompat } from './plugin-compat.js';
 import { findDshRoot, applyRemotePatch, restartDshWeb } from './patch.js';
 import { t, resolveGatewayLang, type Lang } from './i18n.js';
 import { isContainerRuntime, type UpdateEngine } from './update.js';
@@ -134,7 +136,7 @@ type Req = Request & {
   /** session/selectModel 已通过白名单校验的会话 ID；响应回调用它登记会话有效模型。 */
   dshpwModelSessionId?: string;
   /** directoryPicker/list 响应过滤：ancestors 模式只保留通往授权根的条目。 */
-  dshpwDirListFilter?: { mode: 'ancestors'; roots: string[] };
+  dshpwDirListFilter?: { mode: 'ancestors'; roots: string[]; showRoots?: boolean };
 
 };
 
@@ -142,13 +144,12 @@ const AGENT_PRESET_SELECT_RE = /^\/api\/agentPresets?[.\/]select$/;
 const AGENT_PRESET_LIST_RE = /^\/api\/agentPresets?[.\/]list$/;
 const AGENT_PRESET_MUTATION_RE = /^\/api\/agentPresets?[.\/](?:copy|openDocument|remove|read|deletePreset)$/;
 
-/** DSH alpha.2 官方 terminal 的 HTTP unary RPC 面；主用户直接透传，子用户由 allowSsh 控制。 */
+/** DSH 官方 terminal HTTP unary RPC：主用户直通，子用户真实能力始终拒绝。 */
 const OFFICIAL_TERMINAL_HTTP_RE = /^\/api\/terminal[.\/](?:environment|shells|list|create|write|resize|rename|close)$/;
-/** DSH alpha.2 官方 terminal 的 Remote mux 流；主用户直接透传，子用户由 allowSsh 控制。 */
+/** DSH 官方 terminal Remote 流：主用户直通，子用户逐逻辑流拒绝。 */
 const OFFICIAL_TERMINAL_REMOTE_ENDPOINTS = new Set(['terminal/follow', 'terminal/retain']);
 /** 子用户 terminal UX 桩路径（点号/斜杠两种官方写法）：list / environment /
- *  shells / close。allowSsh 关闭时只回一个「不放开能力」的 server-response，
- * 见下方中间件；allowSsh 开启后这些请求也原样透传。 */
+ *  shells / close。对子用户只回不放开能力的 server-response，见下方中间件。 */
 const TERMINAL_STUB_RE = /^\/api\/terminal[.\/](list|environment|shells|close)$/;
 
 /** 与 Remote mux 侧共用：两条通道对同一个「terminal 不可用」失败给出同一文案。 */
@@ -1267,19 +1268,19 @@ export function createGatewayServer(
   options: { envFile?: string; endpointReloadIntervalMs?: number } = {},
 ): http.Server {
   const app = express();
+  // 宿主进程低频推送的已注册 Remote/HTTP 扩展面。已加载扩展不绑定 allow_ssh；
+  // 官方 terminal、SSH 端点和宿主级敏感能力仍由各自边界控制。
+  let dynamicPluginManifest: DynamicPluginManifest | undefined;
   // 测试服务器由本机反向代理转发；只信任 loopback，恢复按真实客户端
   // X-Forwarded-For 计算的 req.ip，同时避免信任公网伪造的代理头。
   app.set('trust proxy', 'loopback');
-  // ── 端点登记表（全部由主用户显式配置；代码不内置任何插件路径）──
-  // 一张表同时管两条通道与两种能力：owner: 前缀 = 仅主用户；其余规则 = 子用户
-  // 需 allow_ssh（两把钥匙）。未登记的第三方路径（/api 与根级插件路由）对子
-  // 用户一律 fail-closed；插件兼容层（默认关）仅用于已知插件的细粒度适配。
+  // ── 传统端点登记表（代码不内置扩展路径）──
+  // owner: 和其余 SSH/宿主登记项都只供主用户使用；
+  // DSH 运行时已登记的普通扩展面由动态清单直接放行，不经过这张表。
   //
   // 运行态可变：部署 .env 变更后由文件尾部的热更新定时器就地替换（无需重启
   // 网关）；未显式指定部署环境文件（DSH_PASSWORDS_ENV_FILE）时不做热更新。
   let endpointRules = config.endpointRules ?? [];
-  let compat = createPluginCompat(config.pluginCompat === true);
-  /** 经端点登记表授权的子用户 WebSocket：规则收紧时用于立即撤销。 */
   const registryAuthorizedSockets = new Set<Duplex>();
   // 不泄露框架信息
   app.disable('x-powered-by');
@@ -1350,6 +1351,64 @@ export function createGatewayServer(
   // 启动协调探针：仅同机插件可读取当前网关绑定的 dsh parent PID。公开
   // healthz 只能证明“有某个 dsh-passwords”，不能证明它属于当前 dsh 进程；
   // 旧 dsh 重启期间必须据此进入等待，而不是误复用旧 child。
+  app.post('/gateway/internal/plugin-manifest', express.json({ limit: '256kb' }), (req, res) => {
+    if (!internalSecretMatches(req)) {
+      res.status(403).json({ ok: false, error: 'forbidden' });
+      return;
+    }
+    const body: unknown = req.body;
+    if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+      res.status(400).json({ ok: false, error: 'invalid manifest' });
+      return;
+    }
+    const manifest = body as Record<string, unknown>;
+    const expectedParentPid = Number(process.env.DSH_GATEWAY_PARENT_PID ?? '');
+    const parentPid = typeof manifest.parentPid === 'number' && Number.isInteger(manifest.parentPid) ? manifest.parentPid : 0;
+    if (Number.isInteger(expectedParentPid) && expectedParentPid > 0 && parentPid !== expectedParentPid) {
+      res.status(409).json({ ok: false, error: 'stale parent' });
+      return;
+    }
+    const generation = typeof manifest.generation === 'string' && /^[A-Za-z0-9._:-]{1,128}$/.test(manifest.generation) ? manifest.generation : '';
+    const namespaces = Array.isArray(manifest.namespaces) ? manifest.namespaces : [];
+    const streams = Array.isArray(manifest.streamEndpoints) ? manifest.streamEndpoints : [];
+    const exactPaths = Array.isArray(manifest.exactPaths) ? manifest.exactPaths : [];
+    const pathPrefixes = Array.isArray(manifest.pathPrefixes) ? manifest.pathPrefixes : [];
+    const validNamespace = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(value);
+    const validStream = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z][A-Za-z0-9_.-]{0,63}\/[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(value);
+    const validManifestPath = (value: unknown): value is string => {
+      if (typeof value !== 'string' || value.length < 2 || value.length > 256 || !value.startsWith('/') ||
+          value.includes('\\') || value.includes('?') || value.includes('#') || /[\u0000-\u001f\u007f]/.test(value)) return false;
+      if (value === '/api' || value === '/api/' || value === '/gateway' || value.startsWith('/gateway/') ||
+          value === '/api/dsh-passwords' || value.startsWith('/api/dsh-passwords/')) return false;
+      const segments = value.split('/').filter((segment) => segment !== '');
+      return segments.length > 0 && segments.every((segment) => segment !== '.' && segment !== '..' && /^[A-Za-z0-9_$.-]{1,96}$/.test(segment));
+    };
+    if (generation === '' || namespaces.length > 512 || streams.length > 512 || exactPaths.length > 512 || pathPrefixes.length > 128 ||
+      !namespaces.every(validNamespace) || !streams.every(validStream)) {
+      res.status(400).json({ ok: false, error: 'invalid manifest' });
+      return;
+    }
+    // 清单来自同机已加载扩展；单条陈旧/宿主保留路径不能让整份普通
+    // 插件清单失效，否则一个 dsh-passwords 自身路由就会让所有扩展 403。
+    const acceptedExactPaths = exactPaths.filter(validManifestPath).slice(0, 512);
+    const acceptedPathPrefixes = pathPrefixes.filter(validManifestPath).slice(0, 128);
+    const acceptedNamespaces = namespaces.filter((namespace): namespace is string =>
+      !OFFICIAL_API_NAMESPACES.has(namespace) && !SUBUSER_BLOCKED_API_NAMESPACES.has(namespace));
+    const acceptedStreams = streams.filter((endpoint): endpoint is string => {
+      const namespace = endpoint.split('/')[0] ?? '';
+      return !OFFICIAL_API_NAMESPACES.has(namespace) && !isSubuserBlockedRemoteEndpoint(endpoint);
+    });
+    const changed = dynamicPluginManifest?.generation !== generation;
+    dynamicPluginManifest = {
+      generation,
+      namespaces: new Set(acceptedNamespaces),
+      streamEndpoints: new Set(acceptedStreams),
+      exactPaths: new Set(acceptedExactPaths),
+      pathPrefixes: new Set(acceptedPathPrefixes),
+    };
+    if (changed) console.log(`[dsh-passwords] 动态插件清单已同步 generation=${generation} namespaces=${namespaces.length} streams=${streams.length} paths=${exactPaths.length + pathPrefixes.length}`);
+    res.json({ ok: true, generation, namespaces: dynamicPluginManifest.namespaces.size, streamEndpoints: dynamicPluginManifest.streamEndpoints.size });
+  });
   app.get('/gateway/internal/owner', (req, res) => {
     if (!internalSecretMatches(req)) {
       res.status(403).json({ ok: false, error: 'forbidden' });
@@ -1457,7 +1516,7 @@ export function createGatewayServer(
         ...(upstreamAuthCookie === '' ? {} : { cookie: upstreamAuthCookie }),
       },
       agent: upstreamAgent,
-      timeout: 3000,
+      timeout: 10_000,
     }, (response) => {
       const chunks: Buffer[] = [];
       let size = 0;
@@ -1488,8 +1547,10 @@ export function createGatewayServer(
 
   // workspaceId → 规范路径映射：从 workspace.list 响应里收集，供 session.create 用 workspaceId 时解析路径
   const workspacePathById = new Map<string, string>();
-  // 子用户默认 64 MiB；勾选 allowUpload（大请求体权限）后与 rc.2
-  // 上游 carrier cap 对齐到 300 MiB。管理员始终使用 300 MiB。
+  // 请求体上限分档（见 requestBodyLimitFor）：主用户恒为 300 MiB；子用户按
+  // allow_upload 决定——关闭时维持默认 64 MiB，开启时才提升到 rc.2 上游一致的
+  // 300 MiB。上限在 proxy 层对声明长度与实际收包执行同一口径；媒体上传另由
+  // 独立的 allow_chat_media 与魔数校验控制。
 
   // dsh rc.8 将归档状态放在全局 workspace registry；session.list 自身经常不带该字段，
   // 因此在网关实例内保存最近一次可信 workspace.list 快照，避免归档会话掉进 Ungrouped。
@@ -1517,6 +1578,7 @@ export function createGatewayServer(
   // 请求开始时记录 epoch，响应/回写时与当前 epoch 比对：不相等即授权已变，
   // 旧请求一律不得回写（权限实际变化时旧请求不能回写）。
   const userAccessEpoch = new Map<number, number>();
+
   // 同一用户 workspace.list 响应的顺序水位（workspaceListRequestRevision 的
   // 用户投影）。与 epoch 完全独立：只用于丢弃乱序的旧列表响应，不参与授权判定。
   const userAccessListOrder = new Map<number, number>();
@@ -1809,8 +1871,10 @@ export function createGatewayServer(
   // row whose user no longer exists is an orphan from a deleted account: no
   // live tenant remains to protect, and treating it as a conflict would hide
   // the folder from baseline and 403 every registration for it.
+  const workspaceOwnersSnapshot = (): ReturnType<Database['listWorkspaceOwners']> => db.listWorkspaceOwners();
+
   const workspaceOwnedByAnotherSubuser = (userId: number, workspacePath: string): boolean => {
-    const owners = db.listWorkspaceOwners();
+    const owners = workspaceOwnersSnapshot();
     if (owners.length === 0) return false;
     // 等值语义保持不变（不是「父工作区包含他人工作区」），但比较改走 canonical 口径：
     // 归一化 + realpath（解析符号链接 / junction）+ Windows 大小写折叠，避免同一目录
@@ -1821,6 +1885,14 @@ export function createGatewayServer(
       samePathForMatch(owner.path, workspacePath),
     );
   };
+  // 「该子用户私有归属的工作区」判定：只有精确相等的注册目录算归属。
+  // 不能用子树包含（pathWithin）代替等值：workspaceOwnedByUser 是会话可见性对
+  // 显式 grant 的替代依据（session.list / workspace.list 槽位 / Remote baseline /
+  // session/follow 与 workspaceFiles 作用域），而 workspaceOwnedByAnotherSubuser
+  // 仍是等值语义（见上）。若此处按子树放宽，则「分配目录恰好嵌在该子用户自建目录
+  // 之内」时，其中由主用户或另一子用户创建、从未逐条授权的既有会话会被自动判定为
+  // 可见（工作区权限 ≠ 会话授权）。子用户自己创建的每一层工作区在登记时都会写入
+  // 自己的 user_workspaces 行，因此等值语义不会阻碍合法流程。
   const workspaceOwnedByUser = (userId: number, workspacePath: string): boolean => {
     const normalizedPath = normalizePath(workspacePath);
     return db.listUserWorkspacePaths(userId).some((ownedPath) => normalizePath(ownedPath) === normalizedPath);
@@ -1838,7 +1910,7 @@ export function createGatewayServer(
  *  物主已被删除的孤儿行不构成冲突（无存活租户可保护）。 */
   const workspaceSubtreeOverlap = (userId: number, workspacePath: string): boolean => {
     const candidate = canonicalizePathBestEffort(workspacePath);
-    return db.listWorkspaceOwners().some((owner) =>
+    return workspaceOwnersSnapshot().some((owner) =>
       owner.userId !== userId &&
       db.getUserById(owner.userId)?.role === 'user' &&
       pathWithin(candidate, canonicalizePathBestEffort(owner.path)),
@@ -1854,7 +1926,7 @@ export function createGatewayServer(
     sessionId: string,
     workspacePath: string,
   ): boolean =>
-    grants.has(sessionId) &&
+    (grants.has(sessionId) || workspaceOwnedByUser(userId, workspacePath)) &&
     !perms.disabled_sessions.includes(sessionId) &&
     folderAllowed(workspacePath, perms.allowed_folders) &&
     !workspaceOwnedByAnotherSubuser(userId, workspacePath);
@@ -2127,9 +2199,9 @@ export function createGatewayServer(
     typeof value === 'string' && value.length > 0 && value.length <= 200 && /^[A-Za-z0-9_-]+$/.test(value);
   /**
    * 逻辑端点名的安全形状（与 DSH 的 segment 字符约束同口径）。
-   * 子用户上报的合法形状端点仍会在 allowlist/rejection map 中二次判定；未知端点
-   * 只结束该逻辑流，不关闭同一 carrier。真正畸形的帧（空段、点段、非法字符或
-   * 超长）才按 carrier-level 拒绝，避免一条合法但未适配的未来端点造成重连风暴。
+   * 子用户上报的合法形状端点按普通扩展面处理：官方/登记流走各自授权与资源过滤，
+   * 其余未知普通端点按通用姿态透明转发（硬拒只由 SUBUSER_BLOCKED namespace 完成）；
+   * 真正畸形的帧（空段、点段、非法字符或超长）才按 carrier-level 拒绝。
    */
   const isRemoteMuxEndpointName = (value: unknown): value is string => {
     if (typeof value !== 'string' || value.length === 0 || value.length > 200) return false;
@@ -2202,7 +2274,7 @@ export function createGatewayServer(
 
   type RemoteMuxUserStreamState = {
     streamId: string;
-    endpoint: 'session/control' | 'session/follow' | 'workspace/follow' | '$events' | 'workspaceFiles/changes' | 'job/list' | 'job/follow' | 'account/watch';
+    endpoint: string;
     jobSessionId?: string;
     jobId?: string;
     jobOwnerConfirmed?: boolean;
@@ -2289,7 +2361,7 @@ export function createGatewayServer(
     if (typeof sessionId !== 'string' || sessionId.length === 0 || sessionId.length > 200) return null;
     const sessionPath = userSessionAccess.get(userId)?.get(sessionId);
     if (sessionPath === undefined) return null;
-    if (!db.hasUserSessionGrant(userId, sessionId)) return null;
+    if (!db.hasUserSessionGrant(userId, sessionId) && !workspaceOwnedByUser(userId, sessionPath)) return null;
     if (perms.disabled_sessions.includes(sessionId)) return null;
     // 白名单与所有权都按「词法 or 真实路径」复核：快照里的 cwd 与 persisted 记录都
     // 可能以别名/大小写/junction 形态出现，只看一种口径要么误拒合法会话（realpath
@@ -2450,7 +2522,7 @@ export function createGatewayServer(
       const sessionAllowed = (sessionId: string): boolean => {
         const sessionPath = access?.get(sessionId);
         return sessionPath !== undefined &&
-          currentGrants.has(sessionId) &&
+          (currentGrants.has(sessionId) || workspaceOwnedByUser(userId, sessionPath)) &&
           !perms.disabled_sessions.includes(sessionId) &&
           folderAllowed(sessionPath, perms.allowed_folders) &&
           !workspaceOwnedByAnotherSubuser(userId, sessionPath);
@@ -2532,8 +2604,11 @@ export function createGatewayServer(
       return candidate !== undefined && candidate.expiresAt > Date.now() && normalizePath(candidate.cwd) === normalizePath(workspacePath) &&
         folderAllowed(candidate.cwd, perms.allowed_folders) && !workspaceOwnedByAnotherSubuser(userId, candidate.cwd);
     };
-    const allowedSession = (id: unknown): id is string =>
-      typeof id === 'string' && access !== undefined && access.has(id) && currentGrants.has(id) && !perms.disabled_sessions.includes(id);
+    const allowedSession = (id: unknown): id is string => {
+      if (typeof id !== 'string' || access === undefined || perms.disabled_sessions.includes(id)) return false;
+      const workspacePath = access.get(id);
+      return workspacePath !== undefined && (currentGrants.has(id) || workspaceOwnedByUser(userId, workspacePath));
+    };
     const workspacePathAllowed = (row: Record<string, unknown>): boolean => {
       const pathValue = row.path;
       if (typeof row.workspaceId !== 'string' || typeof pathValue !== 'string' || !folderAllowed(pathValue, perms.allowed_folders)) return false;
@@ -2543,7 +2618,7 @@ export function createGatewayServer(
       if (!workspacePathAllowed(row)) return false;
       const id = row.workspaceId as string;
       const pathValue = row.path as string;
-      const owners = db.listWorkspaceOwners();
+      const owners = workspaceOwnersSnapshot();
       // 增量 upsert 允许当前用户新建且尚未出现在本连接 baseline 的工作区；
       // 但未知 workspaceId 必须有当前用户的持久化登记，不能只凭目录白名单放行。
       return state.visibleWorkspaces.has(id) || owners.some(
@@ -2617,24 +2692,22 @@ export function createGatewayServer(
           for (const sessionId of sessionIds) {
             if (!pendingSessionAllowed(sessionId, workspacePath)) visibleAccess.set(sessionId, workspacePath);
           }
-          // 首次迁移旧用户时，workspace baseline 本身就是旧行为的可见性来源；
-          // seed 完成后则严格回到持久化 grant，不能把后续新会话自动加入。
+          // 工作区授权不等于既有会话授权：只有显式 session grant 或本次
+          // session/create 产生的 pending 会话可见。baseline 不能把主用户已有会话
+          // 自动迁移给子用户，即使该工作区路径已被分配。
           workspace.sessionIds = sessionIds.filter((sessionId) =>
             !perms.disabled_sessions.includes(sessionId) &&
-            (pendingSessionAllowed(sessionId, workspacePath) || !grantsSeeded || baselineGrants.has(sessionId)),
+            (pendingSessionAllowed(sessionId, workspacePath) || workspaceOwnedByUser(userId, workspacePath) || baselineGrants.has(sessionId)),
           );
           state.visibleWorkspaces.set(id, workspacePath);
           state.visibleWorkspaceRows.set(id, workspace);
           items.push(workspace);
         }
-        // Remote baseline 是 alpha 客户端建立权限快照的第一条可靠数据源；
-        // 首次迁移旧用户时沿用 workspace.list 的一次性 seed 语义：只追加、绝不
-        // 整表替换（同一窗口里子用户 session/create 追加的 grant 不得被抹掉），
-        // 标记与追加在同一事务提交。
-        if (!grantsSeeded) {
-          db.seedUserSessionGrants(userId, [...visibleAccess.keys()].filter((id) => !perms.disabled_sessions.includes(id)));
-        }
-        // seed 之后复读最新 grant：baseline 里可见但从未被显式授权的会话不得回写。
+        // Remote baseline 不会把工作区内的既有会话隐式转成 grant。旧用户只
+        // 标记迁移完成，真正可见的既有会话必须来自主用户显式 session grant；
+        // session/create 的 pending 会话仍由后续 upsert 纳入。
+        if (!grantsSeeded) db.seedUserSessionGrants(userId, []);
+        // 复读最新 grant：baseline 里可见但从未被显式授权的会话不得回写.
         const grants = new Set(db.listUserSessionGrants(userId));
         // baseline 只是一次可见性投影：合并「旧快照里仍然合法的条目」与「本次可见
         // 条目」，避免一次不完整/乱序的 baseline 把仍在授权内的会话抹掉；grant/
@@ -2889,8 +2962,7 @@ export function createGatewayServer(
 
   /** 子用户权限：缺行时默认关闭全部工作区；已有显式空白名单行仍表示不限目录。 */
   function effectivePermissions(userId: number): UserPermissionsRow {
-    return (
-      db.getPermissions(userId) ?? {
+    const value = db.getPermissions(userId) ?? {
         user_id: userId,
         // 新子用户默认关闭全部工作区；旧的显式空数组权限行仍保留“不限制”兼容语义。
         allowed_folders: ['__deny__'],
@@ -2909,8 +2981,8 @@ export function createGatewayServer(
         sandbox_mode: null,
         disabled_sessions: [],
         updated_at: '',
-      }
-    );
+      };
+    return value;
   }
 
   /** 从会话 cookie 解析完整用户（含角色）；无会话/失效返回 null */
@@ -3064,8 +3136,15 @@ export function createGatewayServer(
       return;
     }
 
+    const previousSession = sessionOf(req);
     try {
       const { token, username: loggedInAs } = await auth.login({ username, password }, meta);
+      const loggedInRow = db.getUserByUsername(loggedInAs);
+      if (previousSession !== null && loggedInRow !== null && previousSession.userId !== loggedInRow.id) {
+        // 浏览器切换主/子身份时，旧身份的 Remote carrier 不能继续携带旧授权快照。
+        closeUserWebSocketClients(previousSession.userId, 1008, 'Identity switched');
+        closeUserRemoteMuxClients(previousSession.userId, 1008, 'Identity switched');
+      }
       const nowTs = Date.now();
       const recent = (loginSuccessRate.get(loggedInAs) ?? []).filter((t) => nowTs - t < 60_000);
       if (recent.length >= LOGIN_SUCCESS_MAX_PER_MIN) {
@@ -3309,8 +3388,7 @@ export function createGatewayServer(
   // 机械拆分自本文件原有管理路由段：purge → overview → download →
   // fs/delete-directory → permissions → usage/report；注册顺序与拆分前逐字一致。
   // 共享 helper（apiAuth / jsonBody / stringArray / nullableInt）与跨模块可变状态
-  // Map 一律按【同一引用】注入，绝不复制；可被热更新替换的 let（endpointRules /
-  // compat / hostModelCatalog / upstreamAuthCookie）经 getter 读取实时值。
+  // Map 一律按【同一引用】注入，绝不复制；可被热更新替换的运行态经 getter 读取。
   const adminRoutes = registerAdminRoutes(app, {
     db,
     config,
@@ -3326,7 +3404,6 @@ export function createGatewayServer(
     verifyAdminPassword: (caller, password, meta) => auth.verifyAdminPassword(caller, password, meta),
     systemdPurgeLaunchArgs,
     getEndpointRules: () => endpointRules,
-    getPluginCompatEnabled: () => compat.enabled,
     getHostModelCatalog: () => hostModelCatalog,
     getUpstreamAuthCookie: () => upstreamAuthCookie,
     upstreamHost,
@@ -3648,46 +3725,49 @@ export function createGatewayServer(
             return;
           }
         }
-        // ── 端点分类（网关唯一的路由分类入口，代码不含任何插件专属路径）──
-        //   owner: 登记 → 403；其余登记 → 需 allow_ssh（主用户登记 + 子用户勾选，
-        //   缺一不可）；官方面 → 继续走下面的细粒度权限逻辑；其余（未登记的
-        //   第三方 /api 或根级插件路由）→ fail-closed，仅插件兼容层接管的
-        //   插件面板除外。
+        // ── 端点分类（不包含任何扩展专属路径）──
+        //   owner:/SSH 登记 → 子用户 403；官方面与普通 DSH 扩展面继续走
+        //   对象级权限逻辑；普通未知 HTTP 路由直通，敏感宿主面仍拒绝。
         const pathClass = classifySubuserPath(requestPath, {
           endpointRules,
           transport: 'http',
+          dynamicManifest: dynamicPluginManifest,
         });
-        // 官方 terminal 不依赖登记表：同一个 allowSsh 开关控制官方 terminal 与已登记
-        // 的第三方 SSH。terminal 仍保留硬拒绝分类，避免宽泛登记规则绕过这里的显式
-        // 授权分支；本分支是唯一允许子用户进入官方 terminal 的入口。
+        // 官方 terminal 与登记的宿主能力对子用户不可用；普通 DSH 扩展
+        // 不经过该分支，按通用转发策略处理。
         const officialTerminalHttp = req.method === 'POST' && OFFICIAL_TERMINAL_HTTP_RE.test(requestPath);
         const terminalStub = officialTerminalHttp ? TERMINAL_STUB_RE.exec(requestPath) : null;
         // owner: 规则仍优先于 SSH 总开关：真实宿主能力始终拒绝；四个无能力 UX 桩
         // 无论 allowSsh 状态都返回固定本地响应，保持客户端恢复流程稳定。
+        if (isSubuserBlockedApiPath(requestPath) && terminalStub === null) {
+          res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.adminOnly')));
+          return;
+        }
         if (pathClass === 'owner-only' && terminalStub === null) {
           res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.adminOnly')));
           return;
         }
-        // allowSsh 关闭时，官方 terminal 的真实方法返回明确的权限错误；四个恢复/清理
-        // 桩仍走下面的固定响应，避免客户端进入无休止重试。开启后官方 terminal 直接
-        // 继续进入通用上游代理，第三方端点仍由 pathClass === 'ssh' 处理。
-        if (officialTerminalHttp && pathClass !== 'owner-only' && !perms.allow_ssh && terminalStub === null) {
+        // 官方 terminal 的真实方法返回明确的权限错误；四个恢复/清理桩走固定
+        // 响应，避免客户端进入无休止重试。登记的宿主端点由 ssh 分类拒绝。
+        if (officialTerminalHttp && terminalStub === null) {
+          res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.noSsh')));
+          return;
+        }
+        const hasLegacySshRule = endpointAllowed(requestPath, endpointRules, { capability: 'ssh' });
+        if (hasLegacySshRule && pathClass !== 'ssh' && !officialTerminalHttp) {
+          // 传统 SSH 表中的路径仍受 transport 前缀约束；普通未登记插件
+          // 不进入该分支，因此不会被传统表逻辑误伤。
           res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.noSsh')));
           return;
         }
         if (pathClass === 'ssh') {
-          if (!perms.allow_ssh) {
-            res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.noSsh')));
-            return;
-          }
-        } else if (((pathClass === 'third-party' && !officialTerminalHttp) ||
-          (terminalStub !== null && (pathClass === 'owner-only' || !perms.allow_ssh))) &&
-          !compat.claimsRootPath(requestPath) && changesRoute === null) {
-          // ── 子用户 terminal UX 桩（allowSsh 关闭时）──────────────────────────
+          res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.noSsh')));
+          return;
+        } else if (terminalStub !== null && changesRoute === null) {
+          // ── 子用户 terminal 无能力 UX 桩 ───────────────────────────
           // 官方客户端 TerminalRecovery / 终端面板会调用 list、environment、shells、
-          // close。allowSsh 关闭时直接回 403 会让 restore/setup reject，顶栏与面板进入
-          // 常驻重试，因此这四者回一个「不放开能力」的 server-response；allowSsh 开启
-          // 时同一批已知 RPC 在上面的显式分支中透传。
+          // close。直接回 403 会让 restore/setup 常驻重试，所以这四者只在本地回
+          // 「不放开能力」的 server-response，绝不触达上游。
           //   · list        → ok 空成功（value 必须是裸数组；关闭态不会列出宿主终端，
           //                    空列表恒为真，无信息泄露）。
           //   · environment → ok=false + terminal/unavailable（客户端停止等待 shell）。
@@ -3730,24 +3810,59 @@ export function createGatewayServer(
             });
             return;
           }
-          // 未登记的第三方路径：fail-closed。打印一行日志，便于主用户发现漏登记的端点。
-          console.warn(
-            `[dsh-passwords] 拒绝未登记的第三方路径 method=${req.method} path=${requestPath} user=${user.userId}`,
-          );
-          res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.adminOnly')));
-          return;
+          // 普通插件路径不需要逐插件登记；路径分类已在前面完成 owner/SSH
+          // 边界判断，剩余普通面直接进入上游代理。
         }
 
-        if (!perms.allow_upload && (isUploadRequest(req.method, requestPath) || compat.isFileWrite(req.method, requestPath))) {
+        // ── 官方上传 / git 下载开关（仅子用户；普通第三方插件不受影响）──────────
+        // allow_upload 关闭时官方二进制上传与 fileUploads 上传一律拒绝，请求体上限
+        // 也维持默认 64 MiB（见 proxy 的 requestBodyLimitFor）；开启时才提升到
+        // 300 MiB。allow_git_download 关闭时官方 git 取数据动词（clone/pull/fetch
+        // 等）与 session.export 会话日志下载通道一律拒绝。两条谓词
+        // （isUploadRequest 为精确上传端点；isGitRequest 按 git 前缀与 session.export
+        // 判定）只覆盖官方面，不依赖已移除的插件协议启发式（compat.isFileWrite /
+        // isFileRead / isExfilEndpoint），因此未登记的普通第三方插件路径照常转发。
+        // 官方工作区与会话的对象级路径校验仍由 proxy 层承担。
+        if (!perms.allow_upload && isUploadRequest(req.method, requestPath)) {
           res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.noUpload')));
           return;
         }
-        if (!perms.allow_git_download &&
-            (isGitRequest(requestPath) || compat.isFileRead(req.method, requestPath) || compat.isExfilEndpoint(req.method, requestPath))) {
+        if (!perms.allow_git_download && isGitRequest(requestPath)) {
           res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.noGit')));
           return;
         }
 
+        // DSH calls this no-argument initializer when the sidebar has no workspace.
+        // It targets a host-global default directory, so a subuser must not invoke
+        // the host operation. Return a benign protocol success instead of a noisy
+        // 403; real user-selected workspace creation remains guarded below.
+
+        if (req.method === 'POST' && /^\/api\/workspace[.\/]initializeDefault$/.test(requestPath) && !((req as Req).dshpwIsAdmin === true)) {
+          const chunks: Buffer[] = [];
+          let size = 0;
+          let rejected = false;
+          req.on('data', (chunk: Buffer) => {
+            if (rejected) return;
+            size += chunk.length;
+            if (size > 64 * 1024) rejected = true;
+            else chunks.push(chunk);
+          });
+          req.on('end', () => {
+            if (res.writableEnded) return;
+            try {
+              const value = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>;
+              const rpcId = typeof value.rpcId === 'string' && value.rpcId.length > 0 && value.rpcId.length <= 200 ? value.rpcId : '';
+              if (rejected || value.type !== 'client-request' || value.method !== 'workspace/initializeDefault' || rpcId === '') {
+                res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.workspaceDenied')));
+                return;
+              }
+              res.status(200).type('application/json').send(JSON.stringify({ type: 'server-response', rpcId, result: { ok: true } }));
+            } catch {
+              res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.workspaceDenied')));
+            }
+          });
+          return;
+        }
         const isManagedWorkspaceWrite = isWorkspaceCreate(requestPath) || isWorkspaceDeleteOrRename(requestPath);
         const workspaceOrderWrite = isWorkspaceOrderWrite(requestPath);
         const workspaceManagementAllowed = perms.allow_workspace_create && isManagedWorkspaceWrite;
@@ -3765,22 +3880,7 @@ export function createGatewayServer(
           res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.workspaceDenied')));
           return;
         }
-        // 插件面板文件树（兼容层接管）：GET/HEAD 的 root 在 query 里，直接校验白名单
-        // （拦截目录浏览/下载）。⚠ 只对兼容层声明的面板路径做此检查——提取函数对
-        // 其他路径返回 null，若用 null 判 fail-closed 会把普通 GET/HEAD 全部 403。
-        if (
-          isWorkspaceRestricted(perms.allowed_folders) &&
-          (req.method === 'GET' || req.method === 'HEAD') &&
-          compat.isPanelPath(requestPath)
-        ) {
-          const panelRoot = compat.folderRootFrom(req.method, requestPath, parsed.searchParams, null);
-          // 提取不到 root 时也 fail-closed（之前直接放行→白名单外的目录可被下载）
-          if (panelRoot === null || !folderAllowed(panelRoot, perms.allowed_folders)) {
-            res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.folderDenied')));
-            return;
-          }
-        }
-        if (!isStaticAsset(requestPath) && !isPollingRequest(requestPath) && !compat.isPollingEndpoint(requestPath)) {
+        if (!isStaticAsset(requestPath) && !isPollingRequest(requestPath)) {
           // 配额计时从子用户“说第一句话”（发消息锚点）才开始：
           // 未使用过的子用户（无当日记录且非锚点请求）不创建记录、不受配额限制
           const day = todayLocal();
@@ -3800,17 +3900,6 @@ export function createGatewayServer(
         }
         // 附上权限，供后续文件夹限制中间件 / 代理 token 计量使用
         (req as Req).dshpwPerms = perms;
-      }
-      // ── 插件兼容层纵深防御（仅兼容层开启时生效） ──
-      // 已知上传插件：高危 Web 可解释扩展名（.php/.jsp/.svg 等）拒绝——
-      // 插件本身不限制类型，网关先拦一层（上传目录若被 Web 面暴露即 RCE 面）
-      if (
-        compat.isDangerousUploadRequest(req.method ?? 'GET', gatePath) &&
-        isDangerousUploadName(String(req.headers['x-file-name'] ?? ''))
-      ) {
-        const lang = langOf(req);
-        res.status(403).type('html').send(forbiddenPage(lang, t(lang, 'gw.folderDenied')));
-        return;
       }
       return next();
     } catch {
@@ -3849,11 +3938,9 @@ export function createGatewayServer(
     forceRejectRemoteEventOutcome,
     gatePathOf,
     hasImageAttachment,
-    hiddenUnicodeStripStream,
     hostEventFilter,
     INJECT_SCRIPT,
     isPlainJsonRecord,
-    isTextContentType,
     isTokenRevoked,
     langOf,
     mergeAuthorizedAccess,
@@ -3866,7 +3953,6 @@ export function createGatewayServer(
     OFFICIAL_ACCOUNT_REMOTE_ENDPOINTS,
     OFFICIAL_JOB_REMOTE_ENDPOINTS,
     OFFICIAL_TERMINAL_HTTP_RE,
-    OFFICIAL_TERMINAL_REMOTE_ENDPOINTS,
     originHostMatches,
     parseRemoteMuxClientFrame,
     parseRemoteMuxServerFrame,
@@ -3930,8 +4016,8 @@ export function createGatewayServer(
     workspacePathById,
     workspaceSubtreeOverlap,
     internalSecret: config.internalSecret,
-    getCompat: () => compat,
     getEndpointRules: () => endpointRules,
+    getDynamicPluginManifest: () => dynamicPluginManifest,
     getUpstreamAuthCookie: () => upstreamAuthCookie,
     getHostDefaultModel: () => hostDefaultModel,
     getHostDefaultModelKnown: () => hostDefaultModelKnown,
@@ -4068,14 +4154,12 @@ export function createGatewayServer(
       }
       lastEndpointReloadError = null;
       const changed =
-        read.pluginCompat !== compat.enabled ||
         read.endpointRules.length !== endpointRules.length ||
         read.endpointRules.some((rule, index) => rule !== endpointRules[index]);
       if (!changed) return;
       endpointRules = read.endpointRules;
-      compat = createPluginCompat(read.pluginCompat);
       console.warn(
-        `[dsh-passwords] 端点登记表已热更新：${endpointRules.length} 条规则，插件兼容层 ${read.pluginCompat ? 'on' : 'off'}`,
+        `[dsh-passwords] 端点登记表已热更新：${endpointRules.length} 条规则`,
       );
       for (const socket of registryAuthorizedSockets) {
         try { socket.destroy(); } catch { /* 已断开 */ }

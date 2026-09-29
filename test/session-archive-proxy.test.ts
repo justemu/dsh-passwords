@@ -186,10 +186,10 @@ after(() => {
   }
 });
 
-test('Issue #16: session.list before archive snapshot fails closed', async () => {
+test('Issue #16: session.list before workspace baseline fails closed with a retryable status', async () => {
   const response = await request('POST', '/api/session.list', userCookie);
-  assert.equal(response.status, 502);
-  assert.match(response.text, /unprocessable/);
+  assert.equal(response.status, 503);
+  assert.equal((JSON.parse(response.text) as { code?: string }).code, 'BASELINE_PENDING');
 });
 
 test('Issue #19: legacy subusers are seeded with their visible sessions on first workspace.list', async () => {

@@ -146,8 +146,6 @@ export interface AdminRouteDeps {
 
   /** 端点登记表（热更新 let）：概览按当前快照回显。 */
   getEndpointRules: () => readonly string[];
-  /** 第三方插件兼容层是否开启（热更新 let）。 */
-  getPluginCompatEnabled: () => boolean;
   /** 最近一次官方 modelCatalog 原样快照（热更新 let）；未观测到时为 null。 */
   getHostModelCatalog: () => Record<string, unknown> | null;
   /** 受保护通道登记的 dsh-auth Cookie（热更新 let；目录删除联动唯一凭据来源）。 */
@@ -230,7 +228,6 @@ export function registerAdminRoutes(app: Application, deps: AdminRouteDeps): Adm
     verifyAdminPassword,
     systemdPurgeLaunchArgs,
     getEndpointRules,
-    getPluginCompatEnabled,
     getHostModelCatalog,
     getUpstreamAuthCookie,
     upstreamHost,
@@ -581,9 +578,7 @@ export function registerAdminRoutes(app: Application, deps: AdminRouteDeps): Adm
       me: { id: me.userId, username: me.username, role: me.role },
       // 端点登记表（运维可见性）：规则带 [owner:][ws:|http:] 前缀。
       endpoints: [...getEndpointRules()],
-      // 第三方插件兼容层是否开启（默认关闭）。
-      pluginCompat: getPluginCompatEnabled(),
-      // 最近一次官方 session/modelCatalog 快照；仅主用户 overview 可见。
+      // 最近一次官方 session/modelCatalog 原样快照；仅主用户 overview 可见。
       // 尚未观测到上游目录时返回 null，前端必须保持 fail-closed。
       modelCatalog: getHostModelCatalog(),
       users,
@@ -1759,7 +1754,15 @@ export function registerAdminRoutes(app: Application, deps: AdminRouteDeps): Adm
         banned,
         sandboxMode,
         disabledSessions,
-        ...(sessionAssignmentSubmitted ? { allowedSessionIds, sessionGrantsSeeded: true } : {}),
+        ...(sessionAssignmentSubmitted
+          ? { allowedSessionIds, sessionGrantsSeeded: true }
+          // 仅调整工作区（未提交会话授权）也是显式授权变更：旧数据迁移标记必须在
+          // 同一事务置位，否则新分配工作区里的既有会话会在子用户首次基线时被
+          // “旧用户迁移”一次性种入授权（Issue #19 迁移只适用于从未被重新保存过
+          // 的历史行）。已有 grant 全部保留，绝不被本分支清除。
+          : foldersChanged
+            ? { sessionGrantsSeeded: true }
+            : {}),
         // 基线 = 本请求开始时的集合。上面的 await（资源核验/沙盒注入）期间子用户
         // 可能已追加 grant，或另一管理员已切换 disabled session；数据层在事务内复读
         // 并拒绝用旧集合覆盖任何一类安全集合。
@@ -1796,7 +1799,8 @@ export function registerAdminRoutes(app: Application, deps: AdminRouteDeps): Adm
     // create/fork 响应在该窗口把新会话写回刚保存的授权集合。
     if (accessChanged) fenceUserAccessEpoch(userId);
     // alpha.3 在每次工具执行时从 session log 的 sandbox/mode 折叠真实策略。
-    // 只在确定为收紧时改写已有会话，绝不由权限保存隐式提升旧 session.
+    // 因此受限子用户的每个会话授权都必须先把 log 里的 sandbox 档位注入到授权级
+    // 别，绝不由权限保存隐式提升旧 session。
     // A null historical setting predates this control and may have inherited DSH's
     // broadest mode, so an explicit restrictive setting must be applied to old grants.
     const previousSandboxRank = prevPerms.sandbox_mode === 'read-only'
@@ -1806,13 +1810,20 @@ export function registerAdminRoutes(app: Application, deps: AdminRouteDeps): Adm
         : SANDBOX_RANK['danger-full-access'];
     const sandboxTightened = sandboxMode !== null && SANDBOX_RANK[sandboxMode] < previousSandboxRank;
     let sandboxRevokedSessionIds: string[] = [];
-    if (sandboxTightened && sandboxMode !== null) {
-      // A newly shared session can belong to the administrator. Do not mutate its
-      // global DSH sandbox merely because it was granted to this child account.
-      // Only propagate a tightening to sessions this child could already access.
+    if (sandboxMode !== null) {
       const previouslyGranted = new Set(previousAllowedSessionIds);
-      const existingGrantedSessions = allowedSessionIds.filter((id) => previouslyGranted.has(id));
-      sandboxRevokedSessionIds = await applySandboxToSessions(existingGrantedSessions, sandboxMode);
+      // 收紧策略要重写子用户**已经能访问**的会话（历史 grant 的 log 可能带着主用户
+      // 的更高档位）。此外，本次**新授权**的会话同样必须注入：主用户把自己创建的
+      // 会话共享给受限子用户时，该会话 log 里的 sandbox/mode 是主用户的
+      // （danger-full-access 很常见），不注入等于子用户零操作借共享会话提权。
+      // 两次注入取并集，任一失败都从授权集合回收（fail-closed）：绝不把未确认
+      // 档位的会话留在受限子用户的授权里。
+      const tightenedExisting = sandboxTightened
+        ? allowedSessionIds.filter((id) => previouslyGranted.has(id))
+        : [];
+      const newlyGranted = allowedSessionIds.filter((id) => !previouslyGranted.has(id));
+      const sessionsToEnforce = [...new Set([...tightenedExisting, ...newlyGranted])];
+      sandboxRevokedSessionIds = await applySandboxToSessions(sessionsToEnforce, sandboxMode);
       if (sandboxRevokedSessionIds.length > 0) {
         // 只回收被沙盒策略拒绝的会话；整表替换会抹掉本次 await 期间子用户
         // session/create 并发追加（且并未被拒绝）的会话授权。

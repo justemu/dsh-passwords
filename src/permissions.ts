@@ -8,7 +8,7 @@
 //   - allowUpload            是否使用大请求体/大文件上传档位（false = 64 MiB，true = 300 MiB）
 //   - allowGitDownload       是否允许 git 下载（clone/pull 等）
 //   - allowWorkspaceCreate   是否允许创建/删除/重命名工作区
-//   - allowSsh               是否允许使用主用户配置的 SSH 端点与官方 terminal
+//   - allowSsh               旧数据库兼容字段；不再授予子用户 SSH/terminal 能力
 //   - allowedSessionIds      显式会话授权（未初始化前自动种子化可见会话；保存后新会话不再自动加入）
 //   - disabledSessions       已授权工作区内逐会话关闭的会话 ID（兼容旧行为）
 //   - sandboxMode            沙盒级别（read-only / workspace-write / danger-full-access）
@@ -140,13 +140,27 @@ export function parseEndpointAllowlist(raw: string | undefined, envName: string)
  * 调用方需先剥离 query。可选按能力（owner-only / ssh）与传输通道过滤：
  * 不传 capability 时两种能力的规则都算命中（SSRF 校验等场景）。
  */
+const parsedEndpointRuleCache = new Map<string, ParsedEndpointRule>();
+
+function cachedEndpointRule(rule: string): ParsedEndpointRule {
+  const cached = parsedEndpointRuleCache.get(rule);
+  if (cached !== undefined) return cached;
+  const parsed = parseEndpointRule(rule);
+  if (parsedEndpointRuleCache.size >= 512) {
+    const oldest = parsedEndpointRuleCache.keys().next().value;
+    if (typeof oldest === 'string') parsedEndpointRuleCache.delete(oldest);
+  }
+  parsedEndpointRuleCache.set(rule, parsed);
+  return parsed;
+}
+
 export function endpointAllowed(
   pathname: string,
   rules: readonly string[],
   options: { transport?: 'http' | 'ws'; capability?: EndpointCapability } = {},
 ): boolean {
   for (const rule of rules) {
-    const parsed = parseEndpointRule(rule);
+    const parsed = cachedEndpointRule(rule);
     if (options.capability !== undefined && parsed.capability !== options.capability) continue;
     if (options.transport !== undefined && parsed.transport !== 'any' && parsed.transport !== options.transport) continue;
     if (endpointPathMatches(pathname, parsed.path)) return true;
@@ -189,8 +203,8 @@ export function endpointAllowed(
  * 只读审计：可能放行作用域外路径），网关侧尚无该命名空间的会话/文件夹守卫，
  * 真实 E2E 也未证明隔离；在此之前子用户 fail-closed（见
  * SUBUSER_BLOCKED_API_NAMESPACES）。主用户不经分类，不受影响。
- * ⚠ `pluginManager` 与 `agentTeams` 同样不在清单内，并由
- * SUBUSER_BLOCKED_API_NAMESPACES 硬拒绝（登记规则也无法覆盖）。
+ * `pluginManager` 仍不在清单内，并由 SUBUSER_BLOCKED_API_NAMESPACES 硬拒绝；
+ * Agent Teams 作为已安装扩展可由动态 manifest 自动适配。
  *
  * 官方面 = 本集合（命名空间）∪ OFFICIAL_API_ROUTE_RE（官方精确路由）∪
  * LEGACY_OFFICIAL_API_ROUTE_RE（旧线保留端点），且必须先通过硬拒绝检查
@@ -307,34 +321,30 @@ export function isLegacyOfficialApiRoute(pathname: string): boolean {
  * 子用户硬拒绝的 API 命名空间：先于端点登记表判定，任何登记规则都无法覆盖。
  *
  * `pluginManager`（dsh-plugin-manager）的 change/runPnpm 可在 profile 内安装、
- * 卸载、运行第三方包——等于把特权/RCE 面交给子用户；`agentTeams`
- * （dsh-experimental-agent-team）是 0.1.7 实验特性，现有安全模型没有对应的
- * owner-only 专属授权；`officeToPdf`（dsh-office-to-pdf，0.1.7）的 `render`
+ * 卸载、运行第三方包——等于把特权/RCE 面交给子用户；`officeToPdf`
+ * （dsh-office-to-pdf，0.1.7）的 `render`
  * 接受绝对/工作区相对路径，且底层 workspaceFiles 可能放行作用域外路径（只读
  * 审计尚未证明其隔离边界）。
+ * `dynamicCordisRunner` 涉及动态包定义、host half 生命周期和宿主代码执行，
+ * 仍然硬拒。
  * `terminal`（dsh-api-terminal-controller）的 create/write/follow 等
- * 是宿主侧远程 shell，不能由官方命名空间或第三方登记表自动开放。命中 `/api/*`
- * 这类宽泛规则（或精确规则）时仍归入 third-party，随后由 gateway 的统一 allowSsh
- * 分支决定是否允许；没有该显式权限时仍 fail-closed。`owner:` 登记语义不受影响，
- * 主用户不经分类，不受影响。
+ * 是宿主侧远程 shell，不能由官方命名空间或第三方登记表自动开放。Agent Teams
+ * 等普通扩展须以宿主动态 manifest 作为已安装扩展面。命中 `/api/*`
+ * 这类宽泛规则（或精确规则）时仍归入 third-party；子用户的 terminal RPC
+ * 只能取得无能力 UX 桩或被拒绝。主用户不经分类，不受影响。
  *
- * officeToPdf 的 fail-closed 是临时收紧：在专用授权守卫与真实 E2E 证明作用域
- * 隔离之前，既不做官方自动放行，也不因通用 SSH 登记规则被带入。
- *
- * ⚠ `terminal` 的硬拒绝分类是 0.1.7 安全边界（根因：terminal 原不在本集合，
- * `/api/terminal/*` 一旦被登记就会被归为 ssh，无法区分官方 terminal 与第三方路由）。
- * 进集合后无论通用还是精确 SSH 登记都保持 third-party；gateway 再以 allowSsh 作为
- * 唯一显式开关：关闭时 terminal/list/environment/shells/close 回固定的本地 UX 桩，
- * 其它方法 403/逻辑流拒绝；开启时仅官方 terminal 的已知 HTTP/mux 端点原样透传。
- * 未知 terminal 方法仍 fail-closed。terminal 仍不进 OFFICIAL_API_NAMESPACES；主用户
- * 不经分类，官方 0.1.7 terminal 对主用户由网关原样透传。
+ * officeToPdf 在作用域隔离经过验证前 fail-closed。productAnalytics、
+ * pluginRegistryProbe 和可选的 speech 是宿主级能力，不属于普通扩展透传面。
+ * 未知 terminal 方法仍 fail-closed；历史 allowSsh 权限不改变此边界。
  */
 export const SUBUSER_BLOCKED_API_NAMESPACES: ReadonlySet<string> = new Set([
   'pluginManager',
-  'agentTeams',
-  'officeToPdf',
-  'terminal',
+  'pluginRegistryProbe',
   'dynamicCordisRunner',
+  'officeToPdf',
+  'productAnalytics',
+  'speech',
+  'terminal',
 ]);
 
 /**
@@ -356,8 +366,19 @@ export const SUBUSER_BLOCKED_API_NAMESPACES: ReadonlySet<string> = new Set([
  *     凭据（provider 密钥等）。wire 里只有凭据内容、没有会话身份，网关没有任何
  *     可校验的归属输入；子用户能写凭据就等于能替换宿主身份与上游密钥，fail-closed。
  *   - `settings/openSettingsDocument`（settings Remote）：无路径参数，直接在宿主上
- *     用原生编辑器打开提供方配置文件（在任何沙盒之外）。同命名空间的其余 settings
- *     读写仍按官方路径走网关校验。
+ *     用原生编辑器打开提供方配置文件（在任何沙盒之外）。同命名空间的 `describe`
+ *     为只读且已脱敏（redactSecrets），仍按官方路径走网关校验；写方法见下一条。
+ *   - `settings/mutate` / `settings/update` / `settings/replace`（settings Remote）：
+ *     三者都经同一条 `write(ns, mode, …)` 落盘**宿主全局 settings**（settings.yaml
+ *     的任意命名空间，含 llm/权限/插件等宿主级配置）。产品默认面要求子用户只能使用
+ *     主用户分配的工作区、使用权与新建会话，不能修改宿主全局 settings；这些写请求的
+ *     namespace 与 payload 也没有会话身份，网关无法把写入收敛到某个已授权会话的沙盒，
+ *     因此整体 fail-closed（比逐字段 clamp 更严格，且不依赖上游字段形状）。
+ *   - `llm/discoverModels`（dsh-llm）：`discoverModels(settingsNs, request)` 由调用方
+ *     提供 endpoint/baseURL 与一次性凭据，触发**宿主进程对任意目标发起出站探测**
+ *     （模型发现），属于宿主级出站/SSRF 面而非子用户工作区能力；wire 里没有会话
+ *     身份，网关无法校验目标归属，fail-closed。同命名空间的 listProviders /
+ *     listConfigurableProviders 只是已注册提供方的只读枚举，保持官方面可用。
  *   - `session/openWorkspacePath` / `session/canOpenWorkspacePath` /
  *     `session/workspacePathApplications`（dsh-api-session-controller）：宿主桌面
  *     文件管理器导航、原生能力探测与关联应用枚举。三者 wire 里都**没有会话身份**
@@ -386,7 +407,11 @@ export const SUBUSER_BLOCKED_API_ENDPOINTS: ReadonlySet<string> = new Set([
   'account/signOut',
   'credentials/set',
   'credentials/unset',
+  'llm/discoverModels',
+  'settings/mutate',
   'settings/openSettingsDocument',
+  'settings/replace',
+  'settings/update',
   'session/openWorkspacePath',
   'session/canOpenWorkspacePath',
   'session/workspacePathApplications',
@@ -403,6 +428,12 @@ export const SUBUSER_ALLOWED_ACCOUNT_ENDPOINTS: ReadonlySet<string> = new Set([
  * （`/api/x`、`/api/x.y`、`/api/x/…` 同口径）。
  */
 export function isSubuserBlockedApiPath(pathname: string): boolean {
+  // Root-level routes of sensitive host capabilities need the same boundary as
+  // their /api counterparts, even when the runtime manifest lists a WS route.
+  if (pathname.startsWith('/') && !pathname.startsWith('/api/')) {
+    const root = pathname.slice(1).split('/')[0] ?? '';
+    if (SUBUSER_BLOCKED_API_NAMESPACES.has(root)) return true;
+  }
   const namespace = apiNamespaceOf(pathname);
   if (
     namespace !== null &&
@@ -466,9 +497,9 @@ export function isOfficialRootPath(pathname: string): boolean {
  *
  *   platform    —— 网关自身插件路由（/api/dsh-passwords/*），由其自身守卫鉴权
  *   owner-only  —— 登记表中 owner: 规则：子用户两条通道一律拒绝
- *   ssh         —— 登记表中其余规则：子用户需勾选 allow_ssh（两把钥匙）
- *   official    —— 官方 dsh 面（官方 /api 命名空间 + 官方根级静态/页面路径）
- *   third-party —— 其余路径（未登记的第三方 /api 或根级插件路由）：默认拒绝
+ *   ssh         —— 登记表中其余规则：仅主用户可使用
+ *   official    —— 官方 dsh 面 + 宿主运行时已注册的普通插件面
+ *   third-party —— 其余未登记插件路径：普通 HTTP 直通，WS 须命中清单
  *
  * 判定顺序 owner-only → blocked → ssh → platform → official → third-party：
  * 显式 owner: 登记优先；SUBUSER_BLOCKED_API_NAMESPACES / SUBUSER_BLOCKED_API_ENDPOINTS
@@ -477,16 +508,75 @@ export function isOfficialRootPath(pathname: string): boolean {
  */
 export type SubuserPathClass = 'platform' | 'owner-only' | 'ssh' | 'official' | 'third-party';
 
+/**
+ * 宿主运行时发现的已注册 Remote/HTTP API 面。它只扩展已加载插件的可观测面，
+ * 不猜测未知路径，也不放开硬拒绝的敏感 namespace；动态插件面不复用 allow_ssh。
+ */
+export interface DynamicPluginManifest {
+  namespaces: ReadonlySet<string>;
+  streamEndpoints: ReadonlySet<string>;
+  exactPaths: ReadonlySet<string>;
+  pathPrefixes: ReadonlySet<string>;
+  generation: string;
+}
+
 export function classifySubuserPath(
   pathname: string,
-  options: { endpointRules: readonly string[]; transport: 'http' | 'ws' },
+  options: { endpointRules: readonly string[]; transport: 'http' | 'ws'; dynamicManifest?: DynamicPluginManifest },
 ): SubuserPathClass {
   if (endpointAllowed(pathname, options.endpointRules, { capability: 'owner-only' })) return 'owner-only';
   if (isSubuserBlockedApiPath(pathname)) return 'third-party';
   if (endpointAllowed(pathname, options.endpointRules, { capability: 'ssh', transport: options.transport })) return 'ssh';
   if (pathname === '/api/dsh-passwords' || pathname.startsWith('/api/dsh-passwords/')) return 'platform';
-  if (pathname.startsWith('/api/')) return isOfficialApiPath(pathname) ? 'official' : 'third-party';
-  return isOfficialRootPath(pathname) ? 'official' : 'third-party';
+  if (pathname.startsWith('/api/')) {
+    if (isOfficialApiPath(pathname)) return 'official';
+    if (dynamicPluginApiPath(pathname, options.dynamicManifest)) return 'official';
+    // 普通扩展仍保留 third-party 分类标签；网关授权层不再因此拒绝，
+    // 仅用于与显式 SSH/owner 规则和硬拒边界区分。
+    return 'third-party';
+  }
+  if (isOfficialRootPath(pathname)) return 'official';
+  if (dynamicPluginRootPath(pathname, options.dynamicManifest)) return 'official';
+  // 根级普通插件同样由网关授权层直通；保留 third-party 标签用于
+  // 区分显式 SSH/owner 端点，敏感 endpoint 已在前面的硬拒边界处理。
+  return 'third-party';
+}
+
+/** 动态插件 API/path 判定：只依赖宿主运行时清单，不包含任何插件专属协议。 */
+export function dynamicPluginApiPath(pathname: string, manifest: DynamicPluginManifest | undefined): boolean {
+  if (manifest === undefined) return false;
+  const endpoint = apiEndpointOf(pathname);
+  if (endpoint !== null && manifest.namespaces.has(endpoint.namespace)) return true;
+  return dynamicPluginPathMatch(pathname, manifest);
+}
+
+/** 动态插件根级路由判定；清单路径匹配不扩展到网关内部面。 */
+export function dynamicPluginRootPath(pathname: string, manifest: DynamicPluginManifest | undefined): boolean {
+  if (manifest === undefined || pathname.startsWith('/api/') || pathname.startsWith('/gateway/')) return false;
+  return dynamicPluginPathMatch(pathname, manifest);
+}
+
+function dynamicPluginPathMatch(pathname: string, manifest: DynamicPluginManifest): boolean {
+  if (manifest.exactPaths.has(pathname)) return true;
+  for (const prefix of manifest.pathPrefixes) {
+    const base = prefix.endsWith('/') ? prefix.slice(0, -1) : prefix;
+    if (pathname === base || pathname.startsWith(`${base}/`)) return true;
+  }
+  return false;
+}
+
+/** 动态 Remote 流只在宿主已注册且未命中子用户硬拒边界的面上放行。 */
+export function dynamicPluginStreamAllowed(endpoint: string, manifest: DynamicPluginManifest | undefined): boolean {
+  if (manifest === undefined || !manifest.streamEndpoints.has(endpoint)) return false;
+  return !isSubuserBlockedRemoteEndpoint(endpoint);
+}
+
+/** Remote endpoint 与 HTTP API 共用同一组子用户硬拒边界。 */
+export function isSubuserBlockedRemoteEndpoint(endpoint: string): boolean {
+  const namespace = endpoint.split('/')[0] ?? '';
+  return SUBUSER_BLOCKED_API_NAMESPACES.has(namespace) ||
+    (namespace === 'account' && endpoint !== 'account/watch') ||
+    SUBUSER_BLOCKED_API_ENDPOINTS.has(endpoint);
 }
 
 // ── 官方文件通道（/api/file、present/changes 会话 query 路由）的严格边界判定 ──
@@ -781,7 +871,7 @@ function isPrivateIpv4Bytes(bytes: [number, number, number, number]): boolean {
 }
 
 /** 上传文件名高危扩展名（Web 服务器可解释/可执行类）：
- *  已知上传插件（plugin-compat）不限制类型，网关层纵深防御——
+ *  网关层纵深防御——
  *  若上传目录未来被 Web 面暴露，.php/.jsp/.svg 等可被直接执行/承载脚本。
  *  .py/.sh 等 agent 合法使用的脚本类型不拦（当前下载头已强制 octet-stream+nosniff）。 */
 export function isDangerousUploadName(name: string): boolean {
@@ -1133,9 +1223,8 @@ export function clampSessionHistorySandbox(value: unknown, allowedMode: SandboxM
 
 // ── 上传 / git / 轮询的官方端点判定（纯路径 + 方法，不读请求体） ──────────
 //
-// 说明：第三方插件的同类端点不在网关权限模型内——未登记的第三方路径对子用户
-// 一律 fail-closed（见 classifySubuserPath）；需要放行时由主用户在端点登记表里
-// 显式声明。第三方插件的细粒度适配只存在于 plugin-compat（默认关闭）。
+// 说明：普通扩展端点不在这里按插件协议猜测；已加载扩展由 DSH 运行时清单统一分类。
+// 这里仅保留官方上传/git/轮询以及宿主级边界的通用规则。
 
 /** 上传相关端点：官方会话二进制上传与官方 fileUploads 上传。 */
 export function isUploadRequest(method: string, pathname: string): boolean {
@@ -1961,7 +2050,7 @@ export function isUsageAnchorRequest(pathname: string): boolean {
 /**
  * 轮询 / 心跳 / SSE 事件流端点（官方通道 + 通用命名模式）：页面开着就持续
  * 请求，不代表真实使用，不计入每日使用时长（否则子用户只要开着页面就把时长
- * 配额耗尽）。第三方插件的轮询端点由插件兼容层补充（默认关闭）。
+ * 配额耗尽）。扩展自身的轮询节流由宿主清单和请求生命周期统一处理。
  */
 export function isPollingRequest(pathname: string): boolean {
   return (

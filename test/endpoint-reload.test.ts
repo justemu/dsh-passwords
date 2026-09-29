@@ -1,6 +1,7 @@
 // 端点登记表热更新（改 .env 无需重启网关）回归测试：
 //   1) 写入部署 .env 的登记表规则后，运行中的网关在轮询周期内自动生效；
-//   2) 两把钥匙语义不变：未登记 / 未勾选 SSH 都是 403；
+//   2) 登记在 MCP_GATEWAY_SSH_ENDPOINTS 的 SSH/owner 路由对子用户一律拒绝
+//      （不论 allowSsh true/false，HTTP 与 WS cross transport 都拒），主用户正常；
 //   3) 规则被清空后立即收紧，并断开已授权 WebSocket（撤销语义）；
 //   4) 非法规则保留上一次有效快照（不静默放宽，也不打断已有授权）。
 import { after, before, test } from 'node:test';
@@ -29,10 +30,9 @@ let subId = 0;
 const RELOAD_MS = 25;
 const SETTLE_MS = RELOAD_MS * 6;
 
-function writeEnv(registry?: string, pluginCompat?: string): void {
+function writeEnv(registry?: string): void {
   const lines = ['SETUP_KEY=test-setup-key'];
   if (registry !== undefined) lines.push(`MCP_GATEWAY_SSH_ENDPOINTS=${registry}`);
-  if (pluginCompat !== undefined) lines.push(`MCP_GATEWAY_PLUGIN_COMPAT=${pluginCompat}`);
   lines.push('');
   writeFileSync(envFile, lines.join('\n'));
 }
@@ -49,7 +49,7 @@ function request(pathname: string, cookie: string): Promise<number> {
   return new Promise((resolve, reject) => {
     const req = http.request({
       host: '127.0.0.1', port, path: pathname, method: 'GET',
-      headers: { cookie, 'content-type': 'application/json', 'content-length': '2' },
+      headers: { cookie, 'content-type': 'application/json', 'content-length': '2', connection: 'close' },
     }, (res) => {
       res.resume();
       res.on('end', () => resolve(res.statusCode ?? 0));
@@ -83,13 +83,84 @@ function wsHandshake(pathname: string, cookie: string): Promise<{ status: number
   });
 }
 
+/**
+ * 本机 internal 路由（宿主运行时面）POST：用于「自建清单」授权普通 WS 路径。
+ * 只回显状态码，测试只关心是否登记成功。
+ */
+function postInternal(pathname: string, body: string): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      host: '127.0.0.1', port, path: pathname, method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(body)),
+        'x-internal-secret': 'test-internal',
+        connection: 'close',
+      },
+    }, (res) => {
+      res.resume();
+      res.on('end', () => resolve(res.statusCode ?? 0));
+    });
+    req.on('error', reject);
+    req.end(body);
+  });
+}
+
+/** 用宿主运行时动态清单给子用户授权一条普通（非 SSH）WS 路径，供撤销语义验证。 */
+async function authorizePlainPluginWs(generation: string): Promise<void> {
+  const status = await postInternal('/gateway/internal/plugin-manifest', JSON.stringify({
+    generation,
+    parentPid: process.pid,
+    namespaces: ['pluginlive'],
+    streamEndpoints: [],
+    exactPaths: [],
+    pathPrefixes: [],
+  }));
+  assert.equal(status, 200, '自建清单登记成功');
+}
+
+/** 清单授权的普通（非 SSH）WS 路径，供多处断言复用。 */
+const PLAIN_WS_PATH = '/api/pluginlive/live';
+
+/** 管理员概览：热更新后的当前登记表快照。 */
+function overviewRules(): Promise<string[]> {
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      host: '127.0.0.1', port, path: '/gateway/api/overview', method: 'GET',
+      headers: { cookie: adminCookie, connection: 'close' },
+    }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (chunk: Buffer) => chunks.push(chunk));
+      res.on('end', () => {
+        try { resolve((JSON.parse(Buffer.concat(chunks).toString('utf8')) as { endpoints: string[] }).endpoints); }
+        catch (error) { reject(error); }
+      });
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
 const wait = (ms: number): Promise<void> => new Promise((resolve) => { setTimeout(resolve, ms); });
+
+let revocationSeq = 0;
+/**
+ * 触发一次「有效的」登记表变更，强制网关服务端断开已授权 WS（撤销语义）。
+ * 用于测试清理：客户端主动 destroy() 不会拆掉网关↔上游的升级隧道，只有服务端
+ * 撤销（登记表热更新）会一并断开两侧，避免测试进程被挂起的连接拖住。
+ */
+async function forceRegistryRevocation(): Promise<void> {
+  writeEnv(`/api/plugin/cleanup-${revocationSeq++}`);
+  await wait(SETTLE_MS);
+}
 
 before(async () => {
   tempDir = mkdtempSync(path.join(os.tmpdir(), 'dshpw-reload-'));
   envFile = path.join(tempDir, '.env');
   writeEnv();
   process.env.DSH_PASSWORDS_ENV_FILE = envFile;
+  // 清单登记端点会校验父进程 pid；测试进程不依赖该变量，显式清掉保证确定性。
+  delete process.env.DSH_GATEWAY_PARENT_PID;
   db = new Database(path.join(tempDir, 'test.db'), createFieldCrypto('test-key', 'test-key'));
   db.init();
   const admin = db.createUser('reload-admin', '$2a$10$dummyhashdummyhashdummyhashdu', 'admin');
@@ -115,7 +186,6 @@ before(async () => {
     jwtSecret: 'test-secret', internalSecret: 'test-internal',
     patch: { dshRoot: '', restartService: '' },
     endpointRules: [],
-    pluginCompat: false,
   };
   adminCookie = `dsh_gateway_token=${jwt.sign({ sub: String(admin.id), username: admin.username, cv: 0 }, config.jwtSecret, { expiresIn: '12h' })}`;
   subCookie = `dsh_gateway_token=${jwt.sign({ sub: String(sub.id), username: sub.username, cv: 0 }, config.jwtSecret, { expiresIn: '12h' })}`;
@@ -135,89 +205,98 @@ after(() => {
   try { rmSync(tempDir, { recursive: true, force: true }); } catch { /* Windows 清理尽力而为 */ }
 });
 
-test('热更新：未登记时 fail-closed，写入 .env 后无需重启即生效（两把钥匙都验证）', async () => {
-  assert.equal(await request('/api/plugin/terminal', subCookie), 403, '未登记：子用户 fail-closed');
+test('热更新：普通插件未登记直通，写入 SSH 表后子用户一律拒绝（allowSsh 不再放行）', async () => {
+  assert.equal(await request('/api/plugin/terminal', subCookie), 200, '普通插件未登记时直通');
   assert.equal(await request('/api/plugin/terminal', adminCookie), 200, '未登记：主用户不受登记表限制');
 
   writeEnv('/api/plugin/terminal');
   await wait(SETTLE_MS);
-  assert.equal(await request('/api/plugin/terminal', subCookie), 200, '热更新生效：已登记 + 已勾选 SSH');
+  assert.equal(await request('/api/plugin/terminal', subCookie), 403, '热更新生效：已登记 SSH 路由对子用户拒绝');
+  assert.equal(await request('/api/plugin/terminal', adminCookie), 200, '已登记：主用户仍然正常');
 
-  // 钥匙二：取消勾选后立即 403（无需等待热更新，权限本身就实时生效）
+  // allowSsh 不再是登记路由的放行开关：旧 allowSsh=true 的放行期望收紧为拒绝。
   setSubPermissions(false);
   assert.equal(await request('/api/plugin/terminal', subCookie), 403, '未勾选 SSH：拒绝');
   setSubPermissions(true);
-  assert.equal(await request('/api/plugin/terminal', subCookie), 200, '重新勾选：放行');
+  assert.equal(await request('/api/plugin/terminal', subCookie), 403, '旧 allowSsh=true 也不得越权使用登记路由');
+  setSubPermissions(false);
 });
 
-test('热更新：owner: 前缀与传输前缀在运行中变更同样生效', async () => {
-  writeEnv('owner:/api/plugin/terminal');
-  await wait(SETTLE_MS);
-  assert.equal(await request('/api/plugin/terminal', subCookie), 403, 'owner: 规则对子用户 403');
-
-  writeEnv('ws:/api/plugin/terminal');
-  await wait(SETTLE_MS);
-  assert.equal(await request('/api/plugin/terminal', subCookie), 403, 'ws: 规则不作用于 HTTP 通道');
-
-  writeEnv('http:/api/plugin/terminal');
-  await wait(SETTLE_MS);
-  assert.equal(await request('/api/plugin/terminal', subCookie), 200, 'http: 规则作用于 HTTP 通道');
+test('热更新：owner:/ws:/http: 规则在运行中变更，子用户 HTTP 与 WS 一律拒绝，主用户正常', async () => {
+  try {
+    for (const registry of ['owner:/api/plugin/terminal', 'ws:/api/plugin/terminal', 'http:/api/plugin/terminal']) {
+      writeEnv(registry);
+      await wait(SETTLE_MS);
+      assert.equal(await request('/api/plugin/terminal', subCookie), 403, `${registry}：子用户 HTTP 一律拒绝`);
+      const deniedWs = await wsHandshake('/api/plugin/terminal', subCookie);
+      try {
+        assert.equal(deniedWs.status, 403, `${registry}：子用户 WS 一律拒绝（cross transport）`);
+      } finally {
+        deniedWs.socket?.destroy();
+      }
+      assert.equal(await request('/api/plugin/terminal', adminCookie), 200, `${registry}：主用户 HTTP 正常`);
+    }
+  } finally {
+    // 旧 allowSsh 语义下子用户 WS 会升级成功；断言失败时用一次登记表变更服务端撤销，
+    // 避免已升级连接挂在网关↔上游之间让测试进程无法退出。
+    await forceRegistryRevocation();
+  }
 });
 
 test('热更新：规则被清空后立即收紧，且已授权 WebSocket 被断开（撤销语义）', async () => {
-  writeEnv('ws:/api/plugin/terminal');
+  // 子用户已不可能在登记路由上建立 WS，因此用宿主运行时自建清单授权一条普通 WS；
+  // 它同样进入网关的撤销集合，登记表热更新（此处清空）必须断开它。
+  await authorizePlainPluginWs('reload-revocation');
+  // 先落一个非空快照，确保随后的清空必然是一次变更（否则可能不触发撤销）。
+  writeEnv('/api/plugin/terminal');
   await wait(SETTLE_MS);
-  const allowed = await wsHandshake('/api/plugin/terminal', subCookie);
-  assert.equal(allowed.status, 101, '已登记 WS 端点允许升级');
+  const allowed = await wsHandshake(PLAIN_WS_PATH, subCookie);
+  try {
+    assert.equal(allowed.status, 101, '清单授权的普通 WS 允许升级');
 
-  let closed = false;
-  allowed.socket?.once('close', () => { closed = true; });
-  writeEnv(undefined);
-  await wait(SETTLE_MS);
-  assert.equal(closed, true, '规则清空后已授权 WS 必须被断开');
-  assert.equal(await request('/api/plugin/terminal', subCookie), 403, 'HTTP 侧同样收紧');
+    let closed = false;
+    allowed.socket?.once('close', () => { closed = true; });
+    writeEnv(undefined);
+    await wait(SETTLE_MS);
+    assert.equal(closed, true, '规则清空后已授权 WS 必须被断开');
+    assert.equal(await request('/api/plugin/terminal', subCookie), 200, '普通插件新 HTTP 请求仍直通，旧 WS 连接已撤销');
+  } finally {
+    await forceRegistryRevocation();
+  }
 });
 
 test('热更新：非法规则保留上一次有效快照（不静默放宽、不打断已有授权）', async () => {
   writeEnv('/api/plugin/terminal');
   await wait(SETTLE_MS);
-  assert.equal(await request('/api/plugin/terminal', subCookie), 200, '有效规则生效');
+  assert.deepEqual(await overviewRules(), ['/api/plugin/terminal'], '有效规则生效');
 
-  writeEnv('ws:');
-  await wait(SETTLE_MS);
-  assert.equal(await request('/api/plugin/terminal', subCookie), 200, '非法写法不生效，保持上一次有效规则');
+  // 已授权的普通 WS（清单授权）在非法热更新期间必须保持连接。
+  await authorizePlainPluginWs('reload-invalid-keep');
+  const live = await wsHandshake(PLAIN_WS_PATH, subCookie);
+  try {
+    assert.equal(live.status, 101, '清单授权的普通 WS 允许升级');
+    let closed = false;
+    live.socket?.once('close', () => { closed = true; });
 
-  writeEnv('/gateway/login');
-  await wait(SETTLE_MS);
-  assert.equal(await request('/api/plugin/terminal', subCookie), 200, '网关自身路径同样不生效（保留旧快照）');
+    writeEnv('ws:');
+    await wait(SETTLE_MS);
+    assert.deepEqual(await overviewRules(), ['/api/plugin/terminal'], '非法写法不生效，保持上一次有效规则');
+    assert.equal(closed, false, '非法规则保留旧快照，不打断已有授权');
+
+    writeEnv('/gateway/login');
+    await wait(SETTLE_MS);
+    assert.deepEqual(await overviewRules(), ['/api/plugin/terminal'], '网关自身路径同样不生效（保留旧快照）');
+    assert.equal(closed, false, '非法的网关路径同样不打断已有授权');
+  } finally {
+    await forceRegistryRevocation();
+  }
 });
 
-test('热更新：插件兼容层开关随 .env 变更即时生效', async () => {
-  const overview = (): Promise<{ pluginCompat: boolean; endpoints: string[] }> => new Promise((resolve, reject) => {
-    const req = http.request({
-      host: '127.0.0.1', port, path: '/gateway/api/overview', method: 'GET',
-      headers: { cookie: adminCookie },
-    }, (res) => {
-      const chunks: Buffer[] = [];
-      res.on('data', (chunk: Buffer) => chunks.push(chunk));
-      res.on('end', () => {
-        try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); } catch (error) { reject(error); }
-      });
-    });
-    req.on('error', reject);
-    req.end();
-  });
-
-  writeEnv('/api/plugin/terminal', undefined);
+test('热更新：概览只反映登记表，插件兼容不存在专属开关', async () => {
+  writeEnv('/api/plugin/status');
   await wait(SETTLE_MS);
-  assert.equal((await overview()).pluginCompat, false, '默认关闭');
-
-  writeEnv('/api/plugin/terminal', 'on');
+  assert.deepEqual(await overviewRules(), ['/api/plugin/status'], '登记表同步可见');
+  writeEnv(undefined);
   await wait(SETTLE_MS);
-  assert.equal((await overview()).pluginCompat, true, '热更新打开兼容层');
-  assert.deepEqual((await overview()).endpoints, ['/api/plugin/terminal'], '登记表同步可见');
-
-  writeEnv('/api/plugin/terminal', 'off');
-  await wait(SETTLE_MS);
-  assert.equal((await overview()).pluginCompat, false, '热更新关闭兼容层');
+  assert.deepEqual(await overviewRules(), [], '清空登记表后立即收紧');
 });

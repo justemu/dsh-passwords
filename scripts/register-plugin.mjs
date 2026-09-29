@@ -18,6 +18,23 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
+/**
+ * 运行 pnpm。Windows 上 pnpm 只是 `.cmd` shim，Node >=22（含 24）为修复
+ * CVE-2024-27980 已拒绝 shell:false 直接执行 .cmd/.bat，而 shell:true 又会触发
+ * DEP0190 且存在参数拼接注入面。因此用 cmd.exe 显式启动 shim：
+ * `cmd /d /s /c pnpm.cmd install`（不经 shell:true）。
+ * 注意不能给命令串再加一层引号：Node 会把内层引号转义成 \"，cmd /s 剥壳后
+ * 得到非法命令，因此这里只接受不含引号/百分号/空白的固定字面量参数，否则 fail-closed。
+ */
+function runPnpm(args, cwd) {
+  if (process.platform !== 'win32') return spawnSync('pnpm', args, { cwd, stdio: 'inherit' });
+  if (args.some((arg) => /["%\s]/.test(arg))) {
+    return { error: new Error('pnpm 参数不安全，已拒绝执行'), status: null };
+  }
+  const line = ['pnpm.cmd', ...args].join(' ');
+  return spawnSync(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', line], { cwd, stdio: 'inherit' });
+}
+
 const installRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const dshHome = process.env.DSH_HOME?.trim() || path.join(homedir(), '.dsh');
 const profileDir = path.join(dshHome, 'profiles', 'web');
@@ -89,18 +106,14 @@ if (!existsSync(patchPath)) writeFileSync(patchPath, PATCH_TEMPLATE);
 const workspacePath = path.join(profileDir, 'pnpm-workspace.yaml');
 if (!existsSync(workspacePath)) writeFileSync(workspacePath, WORKSPACE);
 
-// 4) pnpm 物化 link（Windows 需经 shell 调 .cmd shim）。重复 Docker 启动时，
-// manifest 未变化且已物化的 link 仍在，就不再触发网络安装。
+// 4) pnpm 物化 link（Windows 经 cmd.exe 显式调用 .cmd shim，不用 shell:true）。
+// 重复 Docker 启动时，manifest 未变化且已物化的 link 仍在，就不再触发网络安装。
 console.log(`[dsh-passwords] profile: ${profileDir}`);
 if (!manifestChanged && existsSync(path.join(profileDir, 'node_modules', 'dsh-passwords'))) {
   console.log('[dsh-passwords] profile dependencies already ready');
   process.exit(0);
 }
-const result = spawnSync('pnpm', ['install'], {
-  cwd: profileDir,
-  stdio: 'inherit',
-  shell: process.platform === 'win32',
-});
+const result = runPnpm(['install'], profileDir);
 if (result.error !== undefined) {
   console.error(`[dsh-passwords] 运行 pnpm 失败：${String(result.error)}（请先 npm install -g pnpm）`);
   process.exit(127);

@@ -1751,6 +1751,10 @@ export class Database {
       if (current) this.setPermissions(userId, { allowedFolders: [canonical], hourlyTokenLimit: current.hourly_token_limit, dailyMinutesLimit: current.daily_minutes_limit, allowUpload: current.allow_upload, allowGitDownload: current.allow_git_download, allowWorkspaceCreate: current.allow_workspace_create, banned: current.banned, sandboxMode: current.sandbox_mode, disabledSessions: current.disabled_sessions });
       return;
     }
+    // An empty list means unrestricted workspace access. Registering one newly
+    // created workspace must not silently convert that durable permission into
+    // a single-folder allowlist.
+    if (current.allowed_folders.length === 0) return;
     if (!current.allowed_folders.some((entry) => normalizePath(entry) === canonical)) {
       this.setPermissions(userId, { allowedFolders: [...current.allowed_folders, canonical], hourlyTokenLimit: current.hourly_token_limit, dailyMinutesLimit: current.daily_minutes_limit, allowUpload: current.allow_upload, allowGitDownload: current.allow_git_download, allowWorkspaceCreate: current.allow_workspace_create, banned: current.banned, sandboxMode: current.sandbox_mode, disabledSessions: current.disabled_sessions });
     }

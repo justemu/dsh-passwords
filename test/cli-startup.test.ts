@@ -312,6 +312,68 @@ test('unsupported 0.1.8 is rejected before patching or opening a listener', asyn
   }
 });
 
+test('supported 0.2.0 line variants pass the version gate and then require the Cookie bridge', async () => {
+  const settings = 'const persistence = ctx.remote.$host.isLoopback ? "host" : "memory";\n';
+  for (const version of ['0.2.0-rc.1', '0.2.0-alpha.1', '0.2.0']) {
+    const root = mkdtempSync(path.join(tmpdir(), 'dshpw-cli-020-'));
+    const dshRoot = makeAlpha3Root(root, settings, 'export class Connection {}\n', version);
+    const blocker = createServer();
+    await new Promise<void>((resolve) => blocker.listen(0, '0.0.0.0', resolve));
+    const port = (blocker.address() as AddressInfo).port;
+    try {
+      const result = spawnSync(process.execPath, [cli, 'serve-gateway'], {
+        cwd: projectRoot,
+        env: {
+          ...process.env,
+          DSH_PASSWORDS_ENV_FILE: writeConfig(root, dshRoot, {
+            MCP_GATEWAY_PORT: String(port),
+            MCP_GATEWAY_REDIRECT_PORT: '0',
+            MCP_DB_PATH: path.join(root, 'gateway.db'),
+          }),
+          LANG: 'en_US.UTF-8',
+        },
+        encoding: 'utf8',
+        timeout: 20_000,
+      });
+      assert.equal(result.status, 33, `${version}: ${result.stdout}\n${result.stderr}`);
+      assert.match(result.stderr, /Cookie bridge/i, version);
+    } finally {
+      blocker.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test('unsupported 0.2.1 is rejected before patching or opening a listener', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'dshpw-cli-021-'));
+  const settings = 'const persistence = ctx.remote.$host.isLoopback ? "host" : "memory";\n';
+  const dshRoot = makeAlpha3Root(root, settings, 'export class Connection {}\n', '0.2.1-rc.1');
+  const blocker = createServer();
+  await new Promise<void>((resolve) => blocker.listen(0, '0.0.0.0', resolve));
+  const port = (blocker.address() as AddressInfo).port;
+  try {
+    const result = spawnSync(process.execPath, [cli, 'serve-gateway'], {
+      cwd: projectRoot,
+      env: {
+        ...process.env,
+        DSH_PASSWORDS_ENV_FILE: writeConfig(root, dshRoot, {
+          MCP_GATEWAY_PORT: String(port),
+          MCP_GATEWAY_REDIRECT_PORT: '0',
+          MCP_DB_PATH: path.join(root, 'gateway.db'),
+        }),
+        LANG: 'en_US.UTF-8',
+      },
+      encoding: 'utf8',
+      timeout: 20_000,
+    });
+    assert.equal(result.status, 37, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stderr, /Unsupported or invalid DSH version/i);
+  } finally {
+    blocker.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('supported historical prereleases below the old bridge anchors still require the bridge', async () => {
   const settings = 'const persistence = ctx.remote.$host.isLoopback ? "host" : "memory";\n';
   // 这些版本仍在支持的 minor 线内；统一门禁策略要求它们也必须具备 Cookie bridge。

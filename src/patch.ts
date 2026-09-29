@@ -343,13 +343,77 @@ const SEARCH_AUTOFILL_V2_TO =
   '$1"search"$2\n\t\t\t\t\t\t\treadOnly: !searchExpanded,\n\t\t\t\t\t\t\t\'data-dshpw-autofill-harden\': "v2",\n\t\t\t\t\t\t\t\'data-lpignore\': "true",\n\t\t\t\t\t\t\t\'data-1p-ignore\': "true",\n\t\t\t\t\t\t\t\'data-bwignore\': "true",';
 
 
+// ── npm 可执行入口解析 ────────────────────────────────────────────────────────
+// Windows 的 npm 只是 `.cmd` shim。Node >=22（含 24）为修复 CVE-2024-27980 已拒
+// 绝 shell:false 直接执行 .cmd/.bat，spawn/spawnSync 一律返回 EINVAL（Issue #33）。
+// 因此统一优先 `node <npm-cli.js>`：跨平台、不经 shell、参数以数组传递无注入面。
+// 只有确实找不到 npm-cli.js 时才回退 shim。放在本模块是为了让 findDshRoot 与
+// update.ts 共用：update.ts 已依赖 patch.ts，反向 import 会形成循环依赖。
+
+/** spawn 真正接收的调用方式（command + 前置参数） */
+export interface NpmCommand {
+  command: string;
+  args: string[];
+}
+
+/** npm CLI 的 JS 入口；找不到返回 null。 */
+function npmCliEntry(env: NodeJS.ProcessEnv): string | null {
+  // npm start / npm test 启动时 npm_execpath 指向正在使用的 npm CLI 入口，
+  // 优先采信它以跟随调用方实际使用的 npm。只接受 npm 自身的 JS 入口——
+  // pnpm/yarn 的 execpath 拿来执行 npm 参数会跑错包管理器。
+  const execpath = env.npm_execpath?.trim() ?? '';
+  if (execpath !== '' && /^npm[\w.-]*\.(?:cjs|mjs|js)$/i.test(path.basename(execpath)) && existsSync(execpath)) {
+    return path.resolve(execpath);
+  }
+  const nodeDir = path.dirname(process.execPath);
+  for (const candidate of [
+    path.join(nodeDir, 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+    path.join(nodeDir, '..', 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+  ]) {
+    try {
+      if (existsSync(candidate)) return path.resolve(candidate);
+    } catch {
+      /* 受限环境读不到候选路径时继续尝试下一个 */
+    }
+  }
+  return null;
+}
+
+/**
+ * Windows 回退方式：`cmd /d /s /c "<npm.cmd> …"`（与 scripts/install.mjs 同口径，
+ * 不用 shell:true，避开 DEP0190 弃用警告与参数拼接）。
+ * 参数含双引号、百分号（环境变量展开）或换行会破坏命令串 → 返回 null，调用方必须 fail-closed，
+ * 绝不能把未转义文本拼进 shell 命令串。
+ */
+export function windowsNpmShimArgs(args: string[]): string[] | null {
+  if (args.some((arg) => /["%\r\n]/.test(arg))) return null;
+  const line = ['npm.cmd', ...args].map((arg) => `"${arg}"`).join(' ');
+  return ['/d', '/s', '/c', `"${line}"`];
+}
+
+/**
+ * 解析执行 npm 子命令的方式（Issue #33）：
+ * 1. `node <npm-cli.js>`——首选，Windows/Linux/macOS 通用，shell:false 可执行；
+ * 2. Windows 找不到 npm-cli.js——cmd.exe 显式启动 npm.cmd shim；
+ * 3. 其他平台——直接 `npm`（.cmd shim 问题只存在于 Windows）。
+ * 参数不安全（见 windowsNpmShimArgs）时返回 null。
+ */
+export function resolveNpmCommand(args: string[], env: NodeJS.ProcessEnv = process.env): NpmCommand | null {
+  const cli = npmCliEntry(env);
+  if (cli !== null) return { command: process.execPath, args: [cli, ...args] };
+  if (process.platform !== 'win32') return { command: 'npm', args: [...args] };
+  const shimArgs = windowsNpmShimArgs(args);
+  if (shimArgs === null) return null;
+  return { command: env.ComSpec?.trim() || 'cmd.exe', args: shimArgs };
+}
+
 /** 找到 dsh 安装根目录（@deepseek-ai/dsh），找不到返回 null */
 export function findDshRoot(explicit: string): string | null {
   if (explicit) return existsSync(explicit) ? explicit : null;
   try {
-    const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-    const result = spawnSync(npmCommand, ['root', '-g'], { encoding: 'utf8' });
-    const globalRoot = result.status === 0 && typeof result.stdout === 'string' ? result.stdout.trim() : '';
+    const npm = resolveNpmCommand(['root', '-g']);
+    const result = npm === null ? null : spawnSync(npm.command, npm.args, { encoding: 'utf8', shell: false, windowsHide: true });
+    const globalRoot = result !== null && result.status === 0 && typeof result.stdout === 'string' ? result.stdout.trim() : '';
     const candidate = globalRoot === '' ? '' : path.join(globalRoot, '@deepseek-ai', 'dsh');
     if (candidate !== '' && existsSync(candidate)) return candidate;
   } catch {
@@ -619,7 +683,7 @@ export function rollbackPatch(
 /** 延迟重启 dsh 网页服务（补丁生效需要 dsh 重新加载模块）；仅适用于常驻进程
  *  用 spawnSync 参数数组（不拼 shell），杜绝命令注入；服务名仍做字符白名单
  *  双保险（systemctl 只接受合法 unit 名）。 */
-export function restartDshWebChecked(service: string, delayMs = 2500): Promise<{ ok: boolean; message: string }> {
+export function restartDshWebChecked(service: string, delayMs = 2500): Promise<{ ok: boolean; message: string; manual?: boolean }> {
   return new Promise((resolve) => {
     if (!service) {
       resolve({ ok: false, message: '未配置 dsh-web 服务名' });
@@ -627,6 +691,10 @@ export function restartDshWebChecked(service: string, delayMs = 2500): Promise<{
     }
     if (!/^[A-Za-z0-9_.@-]+$/.test(service)) {
       resolve({ ok: false, message: '重启服务名非法' });
+      return;
+    }
+    if (process.platform === 'win32') {
+      resolve({ ok: false, manual: true, message: 'Windows 不支持 systemd，请重启 DeepSeek Harness' });
       return;
     }
     const timer = setTimeout(() => {
@@ -647,6 +715,7 @@ export function restartDshWebChecked(service: string, delayMs = 2500): Promise<{
 
 export function restartDshWeb(service: string, delayMs = 2500): void {
   void restartDshWebChecked(service, delayMs).then((result) => {
-    if (!result.ok) console.error(`[dsh-passwords] 重启 ${service} 失败（补丁将在下次 dsh 重启后生效）: ${result.message}`);
+    if (!result.ok && !result.manual) console.error(`[dsh-passwords] 重启 ${service} 失败（补丁将在下次 dsh 重启后生效）: ${result.message}`);
+    if (result.manual) console.error(`[dsh-passwords] ${result.message}`);
   });
 }

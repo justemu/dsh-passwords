@@ -23,7 +23,6 @@ function configFor(port: number): PlatformConfig {
     internalSecret: 'test-internal',
     patch: { dshRoot: '', restartService: '' },
     endpointRules: [],
-    pluginCompat: false,
   };
 }
 

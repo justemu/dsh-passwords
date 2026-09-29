@@ -138,7 +138,7 @@ test('settings card renders account and patch controls for a healthy response', 
   assert.doesNotMatch(card.text(), /card-crashed/);
 });
 
-test('settings card synchronizes the SSH permission beside upload and save API', async (t) => {
+test('settings card does not offer legacy SSH access to subusers', async (t) => {
   const card = await mountCard(t, {
     '/gateway/api/permissions': () => Response.json({ ok: true }),
   }, {
@@ -166,20 +166,14 @@ test('settings card synchronizes the SSH permission beside upload and save API',
       }],
     },
   });
-  const sshLabel = card.renderer.root.findAllByType('label').find((label) => label.children.some((child) => child === 'permsSsh'));
-  assert.ok(sshLabel, 'SSH 权限开关必须出现在上传权限附近');
-  const checkbox = sshLabel!.findByType('input');
-  assert.equal(checkbox.props.checked, false);
-  assert.equal(checkbox.props['aria-label'], 'permsSsh');
-  await act(async () => { checkbox.props.onChange({ target: { checked: true } }); });
-  const saveButton = card.renderer.root.findAllByType('button').find((button) => button.children.some((child) => child === 'permsSave'));
-  assert.ok(saveButton);
-  await act(async () => { saveButton!.props.onClick(); });
-  const permissionRequest = card.requests.find((request) => request.input === '/gateway/api/permissions');
-  assert.ok(permissionRequest);
-  const permissionBody = JSON.parse(String(permissionRequest!.init?.body)) as Record<string, unknown>;
-  assert.equal(permissionBody.allowSsh, true);
-  assert.equal('expectedDisabledSessions' in permissionBody, false, '仅修改 SSH 时不得提交无关的禁用会话 CAS 基线');
+  const sshLabel = card.renderer.root.findAllByType('label').find((label) => label.children.includes('permsSsh'));
+  assert.equal(sshLabel, undefined, '旧字段不能呈现为可授予的子用户 SSH 权限');
+  assert.equal(card.renderer.root.findAllByProps({ 'aria-label': 'permsSsh' }).length, 0);
+  await savePermissions(card);
+  const [body] = permissionBodies(card);
+  assert.ok(body);
+  assert.equal('allowSsh' in body, false);
+  assert.equal('expectedDisabledSessions' in body, false, '未修改会话时不得提交禁用会话 CAS 基线');
 });
 
 test('settings card synchronizes an explicitly changed session permission with its CAS baseline', async (t) => {
@@ -384,28 +378,29 @@ test('saving a workspace-only change omits allowedSessionIds so server grants su
   assert.equal('disabledSessions' in body!, false, '未编辑会话时不得覆盖并发更新的禁用集合');
 });
 
-test('saving an SSH-only change omits allowedSessionIds', async (t) => {
+test('legacy SSH grant cannot be edited and saving unrelated permissions preserves session grants', async (t) => {
   const card = await mountCard(t, {
     '/gateway/api/permissions': () => Response.json({ ok: true }),
   }, {
-    '/gateway/api/overview': subuserOverview(['sess-1']),
+    '/gateway/api/overview': {
+      ...subuserOverview(['sess-1']),
+      users: [{ ...subuserOverview(['sess-1']).users[0], permissions: {
+        ...subuserOverview(['sess-1']).users[0].permissions, allowSsh: true,
+      } }],
+    },
     '/api/dsh-passwords/workspaces': permissionWorkspaces,
   });
-  const sshLabel = card.renderer.root.findAllByType('label')
-    .find((label) => label.children.some((child) => child === 'permsSsh'));
-  assert.ok(sshLabel, 'SSH 权限开关必须渲染');
-  await act(async () => {
-    sshLabel!.findByType('input').props.onChange({ target: { checked: true } });
-  });
+  assert.equal(card.renderer.root.findAllByType('label').some((label) => label.children.includes('permsSsh')), false);
+  const workspaceSwitch = card.renderer.root.findAllByProps({ className: 'dshpw-switch dshpw-workspace-switch' })
+    .find((node) => node.findAllByType('input').length === 1);
+  assert.ok(workspaceSwitch);
+  await act(async () => { workspaceSwitch.findByType('input').props.onChange({ target: { checked: false } }); });
   await savePermissions(card);
   const [body] = permissionBodies(card);
   assert.ok(body);
-  assert.equal(body!.allowSsh, true);
-  for (const field of ['allowedFolders', 'hourlyTokenLimit', 'dailyMinutesLimit', 'sandboxMode', 'banned', 'allowedModels']) {
-    assert.equal(field in body!, false, `仅修改 SSH 时不得提交陈旧的 ${field}`);
-  }
-  assert.equal('allowedSessionIds' in body!, false, '未编辑会话时不得提交 allowedSessionIds');
-  assert.equal('disabledSessions' in body!, false, '未编辑会话时不得覆盖并发更新的禁用集合');
+  assert.equal('allowSsh' in body, false);
+  assert.equal('allowedSessionIds' in body, false, '未编辑会话时不得提交 allowedSessionIds');
+  assert.equal('disabledSessions' in body, false, '未编辑会话时不得覆盖禁用集合');
 });
 
 test('saving after toggling a session submits the session allowlist', async (t) => {
@@ -505,12 +500,10 @@ test('the session touch marker resets after a successful save', async (t) => {
   });
   await savePermissions(card);
 
-  const sshLabel = card.renderer.root.findAllByType('label')
-    .find((label) => label.children.some((child) => child === 'permsSsh'));
-  assert.ok(sshLabel);
-  await act(async () => {
-    sshLabel!.findByType('input').props.onChange({ target: { checked: true } });
-  });
+  const workspaceSwitch = card.renderer.root.findAllByProps({ className: 'dshpw-switch dshpw-workspace-switch' })
+    .find((node) => node.findAllByType('input').length === 1);
+  assert.ok(workspaceSwitch);
+  await act(async () => { workspaceSwitch.findByType('input').props.onChange({ target: { checked: false } }); });
   await savePermissions(card);
 
   const bodies = permissionBodies(card);
