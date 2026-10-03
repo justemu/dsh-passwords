@@ -23,11 +23,14 @@ function writeConfig(root: string, dshRoot: string, overrides: Record<string, st
   return envFile;
 }
 
-function makeAlpha3Root(
+// The plain settings/connection fixtures. Version defaults to the reviewed pin so a
+// fixture that is supposed to clear the identity gate and fail later on the bridge or
+// patch target actually reaches that later check.
+function makeDshRoot(
   root: string,
   settings: string | null,
   connection: string,
-  version = '0.1.2-alpha.5',
+  version = '0.2.1-alpha.1',
 ): string {
   const dshRoot = path.join(root, 'dsh');
   const settingsPath = path.join(dshRoot, 'node_modules', '@deepseek-ai', 'dsh-client-ui-settings', 'lib', 'client.js');
@@ -68,9 +71,9 @@ test('gateway refuses startup when the explicitly configured DSH root is absent'
   }
 });
 
-test('alpha.3 gateway refuses startup when the settings anchor cannot be patched', () => {
+test('gateway refuses startup when the settings anchor cannot be patched', () => {
   const root = mkdtempSync(path.join(tmpdir(), 'dshpw-cli-settings-'));
-  const dshRoot = makeAlpha3Root(root, 'export const persistence = "memory";\n', 'export class Connection {}\n');
+  const dshRoot = makeDshRoot(root, 'export const persistence = "memory";\n', 'export class Connection {}\n');
   try {
     const result = startGateway(writeConfig(root, dshRoot));
     assert.equal(result.status, 35, `${result.stdout}\n${result.stderr}`);
@@ -83,76 +86,13 @@ test('alpha.3 gateway refuses startup when the settings anchor cannot be patched
 test('gateway refuses startup when the Cookie bridge is unavailable', () => {
   const root = mkdtempSync(path.join(tmpdir(), 'dshpw-cli-cookie-'));
   const settings = 'const persistence = ctx.remote.$host.isLoopback ? "host" : "memory";\n';
-  const dshRoot = makeAlpha3Root(root, settings, 'export class Connection {}\n');
+  const dshRoot = makeDshRoot(root, settings, 'export class Connection {}\n');
   try {
     const result = startGateway(writeConfig(root, dshRoot));
     assert.equal(result.status, 33, `${result.stdout}\n${result.stderr}`);
     assert.match(result.stderr, /Cookie bridge/i);
   } finally {
     rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test('rc.1 gateway refuses startup when the Cookie bridge is unavailable', () => {
-  const root = mkdtempSync(path.join(tmpdir(), 'dshpw-cli-rc1-cookie-'));
-  const settings = 'const persistence = ctx.remote.$host.isLoopback ? "host" : "memory";\n';
-  const dshRoot = makeAlpha3Root(root, settings, 'export class Connection {}\n', '0.1.2-rc.1');
-  try {
-    const result = startGateway(writeConfig(root, dshRoot));
-    assert.equal(result.status, 33, `${result.stdout}\n${result.stderr}`);
-    assert.match(result.stderr, /Cookie bridge/i);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test('0.1.5 rc.1 gateway refuses startup when the Cookie bridge is unavailable', () => {
-  const root = mkdtempSync(path.join(tmpdir(), 'dshpw-cli-rc15-cookie-'));
-  const settings = 'const persistence = ctx.remote.$host.isLoopback ? "host" : "memory";\n';
-  const dshRoot = makeAlpha3Root(root, settings, 'export class Connection {}\n', '0.1.5-rc.1');
-  try {
-    const result = startGateway(writeConfig(root, dshRoot));
-    assert.equal(result.status, 33, `${result.stdout}\n${result.stderr}`);
-    assert.match(result.stderr, /Cookie bridge/i);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test('0.1.5 rc.2 gateway refuses startup when the Cookie bridge is unavailable', () => {
-  const root = mkdtempSync(path.join(tmpdir(), 'dshpw-cli-rc15-cookie-'));
-  const settings = 'const persistence = ctx.remote.$host.isLoopback ? "host" : "memory";\n';
-  const dshRoot = makeAlpha3Root(root, settings, 'export class Connection {}\n', '0.1.5-rc.2');
-  try {
-    const result = startGateway(writeConfig(root, dshRoot));
-    assert.equal(result.status, 33, `${result.stdout}\n${result.stderr}`);
-    assert.match(result.stderr, /Cookie bridge/i);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-// Semver-valid build metadata and multi-identifier prereleases must not let an identity
-// that already needs the bridge (the anchor identifier decides) evade the gate.
-const GATED_LEGACY_VARIANTS = [
-  '0.1.5-rc.2+build.1',
-  '0.1.2-alpha.3.1',
-  '0.1.2-rc.1.2',
-  '0.1.5-alpha.1.5',
-];
-
-test('legacy gated releases with build metadata or multi-identifier prereleases still refuse startup', () => {
-  const settings = 'const persistence = ctx.remote.$host.isLoopback ? "host" : "memory";\n';
-  for (const version of GATED_LEGACY_VARIANTS) {
-    const root = mkdtempSync(path.join(tmpdir(), 'dshpw-cli-legacy-cookie-'));
-    const dshRoot = makeAlpha3Root(root, settings, 'export class Connection {}\n', version);
-    try {
-      const result = startGateway(writeConfig(root, dshRoot));
-      assert.equal(result.status, 33, `${version}: ${result.stdout}\n${result.stderr}`);
-      assert.match(result.stderr, /Cookie bridge/i, version);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
   }
 });
 
@@ -161,7 +101,7 @@ test('legacy gated releases with build metadata or multi-identifier prereleases 
 test('gateway refuses startup when the DSH manifest is corrupt or missing (fail closed)', async () => {
   const root = mkdtempSync(path.join(tmpdir(), 'dshpw-cli-manifest-'));
   const settings = 'const persistence = ctx.remote.$host.isLoopback ? "host" : "memory";\n';
-  const dshRoot = makeAlpha3Root(root, settings, 'export class Connection {}\n');
+  const dshRoot = makeDshRoot(root, settings, 'export class Connection {}\n');
   const manifestPath = path.join(dshRoot, 'package.json');
   // 若门禁回归为 fail-open，启动会走到 listen；占住端口让其快速以 32 退出并暴露回归，
   // 而不是挂起到 spawn 超时。
@@ -170,7 +110,7 @@ test('gateway refuses startup when the DSH manifest is corrupt or missing (fail 
   const port = (blocker.address() as AddressInfo).port;
   try {
     for (const mode of ['corrupt', 'missing'] as const) {
-      if (mode === 'corrupt') writeFileSync(manifestPath, '{"version": "0.1.5-rc.2",\n');
+      if (mode === 'corrupt') writeFileSync(manifestPath, '{"version": "0.2.1-alpha.1",\n');
       else rmSync(manifestPath, { force: true });
       const result = spawnSync(process.execPath, [cli, 'serve-gateway'], {
         cwd: projectRoot,
@@ -195,66 +135,29 @@ test('gateway refuses startup when the DSH manifest is corrupt or missing (fail 
   }
 });
 
-test('0.1.6 alpha.1 gateway refuses startup when the Cookie bridge is unavailable', () => {
-  const root = mkdtempSync(path.join(tmpdir(), 'dshpw-cli-016a1-cookie-'));
+// The support window is the single patch line `>=0.2.1-alpha.1 <0.2.2-0`; the accepted
+// identities are the reviewed alpha.1 pin, the later 0.2.1 prereleases, and the stable
+// 0.2.1 release. Build metadata and multi-identifier prereleases must not let an accepted
+// identity slip past the downstream Cookie-bridge gate either.
+test('supported 0.2.1 patch-line variants pass the version gate and then require the Cookie bridge', async () => {
   const settings = 'const persistence = ctx.remote.$host.isLoopback ? "host" : "memory";\n';
-  const dshRoot = makeAlpha3Root(root, settings, 'export class Connection {}\n', '0.1.6-alpha.1');
-  try {
-    const result = startGateway(writeConfig(root, dshRoot));
-    assert.equal(result.status, 33, `${result.stdout}\n${result.stderr}`);
-    assert.match(result.stderr, /Cookie bridge/i);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test('0.1.6 alpha.2 gateway refuses startup when the Cookie bridge is unavailable', () => {
-  const root = mkdtempSync(path.join(tmpdir(), 'dshpw-cli-016a2-cookie-'));
-  const settings = 'const persistence = ctx.remote.$host.isLoopback ? "host" : "memory";\n';
-  const dshRoot = makeAlpha3Root(root, settings, 'export class Connection {}\n', '0.1.6-alpha.2');
-  try {
-    const result = startGateway(writeConfig(root, dshRoot));
-    assert.equal(result.status, 33, `${result.stdout}\n${result.stderr}`);
-    assert.match(result.stderr, /Cookie bridge/i);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-// 0.1.6 整条线都走 Cookie 桥门禁：stable 与任意合规的预发布/构建通道；
-// 缺桥必须 fail-closed（退出码 33），不能被 launch token 静默降级。
-const GATED_016_VERSIONS = [
-  '0.1.6-alpha.10',
-  '0.1.6-beta.1',
-  '0.1.6-next.3',
-  '0.1.6-rc.1',
-  '0.1.6-rc.2',
-  '0.1.6-build.7',
-  '0.1.6+build.5',
-  '0.1.6-alpha.2+build.1',
-  '0.1.6',
-];
-
-test('0.1.6 line variants all refuse startup when the Cookie bridge is unavailable', () => {
-  const settings = 'const persistence = ctx.remote.$host.isLoopback ? "host" : "memory";\n';
-  for (const version of GATED_016_VERSIONS) {
-    const root = mkdtempSync(path.join(tmpdir(), 'dshpw-cli-016line-cookie-'));
-    const dshRoot = makeAlpha3Root(root, settings, 'export class Connection {}\n', version);
-    try {
-      const result = startGateway(writeConfig(root, dshRoot));
-      assert.equal(result.status, 33, `${version}: ${result.stdout}\n${result.stderr}`);
-      assert.match(result.stderr, /Cookie bridge/i, version);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  }
-});
-
-test('supported 0.1.7 line variants pass the version gate and then require the Cookie bridge', async () => {
-  const settings = 'const persistence = ctx.remote.$host.isLoopback ? "host" : "memory";\n';
-  for (const version of ['0.1.7-alpha.1', '0.1.7-alpha.2', '0.1.7-alpha.12', '0.1.7-beta.1', '0.1.7-rc.1', '0.1.7-rc.2', '0.1.7-preview.4', '0.1.7+build.1', '0.1.7']) {
-    const root = mkdtempSync(path.join(tmpdir(), 'dshpw-cli-017-'));
-    const dshRoot = makeAlpha3Root(root, settings, 'export class Connection {}\n', version);
+  const versions = [
+    '0.2.1-alpha.1',
+    '0.2.1-alpha.2',
+    '0.2.1-alpha.10',
+    '0.2.1-alpha.20',
+    '0.2.1-alpha.3.1',
+    '0.2.1-beta.1',
+    '0.2.1-rc.1',
+    '0.2.1-rc.2',
+    '0.2.1-preview.4',
+    '0.2.1-alpha.1+build.9',
+    '0.2.1+build.1',
+    '0.2.1',
+  ];
+  for (const version of versions) {
+    const root = mkdtempSync(path.join(tmpdir(), 'dshpw-cli-021-'));
+    const dshRoot = makeDshRoot(root, settings, 'export class Connection {}\n', version);
     const blocker = createServer();
     await new Promise<void>((resolve) => blocker.listen(0, '0.0.0.0', resolve));
     const port = (blocker.address() as AddressInfo).port;
@@ -282,109 +185,38 @@ test('supported 0.1.7 line variants pass the version gate and then require the C
   }
 });
 
-test('unsupported 0.1.8 is rejected before patching or opening a listener', async () => {
-  const root = mkdtempSync(path.join(tmpdir(), 'dshpw-cli-018-'));
+// Every identity outside the 0.2.1 patch line is an identity boundary: the retired 0.1.x
+// head, the retired 0.2.0 line, the pre-pin 0.2.1-alpha.0 / bare 0.2.1-alpha / numeric-only
+// 0.2.1 prerelease, and every 0.2.2+/0.3 identity must be rejected (37) before any patch or
+// public listener.
+test('retired and out-of-window DSH lines are rejected before patching or opening a listener', async () => {
   const settings = 'const persistence = ctx.remote.$host.isLoopback ? "host" : "memory";\n';
-  const dshRoot = makeAlpha3Root(root, settings, 'export class Connection {}\n', '0.1.8-alpha.1');
+  const versions = [
+    '0.1.2-alpha.5',
+    '0.1.3',
+    '0.1.5-rc.2',
+    '0.1.6-alpha.2',
+    '0.1.7',
+    '0.1.7-rc.2',
+    '0.1.8-alpha.1',
+    '0.2.0',
+    '0.2.0-rc.2',
+    '0.2.0-alpha.1',
+    '0.2.1-alpha',
+    '0.2.1-alpha.0',
+    '0.2.1-0',
+    '0.2.2-rc.1',
+    '0.2.2',
+    '0.2.2-alpha.1',
+    '0.3.0-alpha.1',
+  ];
   const blocker = createServer();
   await new Promise<void>((resolve) => blocker.listen(0, '0.0.0.0', resolve));
   const port = (blocker.address() as AddressInfo).port;
   try {
-    const result = spawnSync(process.execPath, [cli, 'serve-gateway'], {
-      cwd: projectRoot,
-      env: {
-        ...process.env,
-        DSH_PASSWORDS_ENV_FILE: writeConfig(root, dshRoot, {
-          MCP_GATEWAY_PORT: String(port),
-          MCP_GATEWAY_REDIRECT_PORT: '0',
-          MCP_DB_PATH: path.join(root, 'gateway.db'),
-        }),
-        LANG: 'en_US.UTF-8',
-      },
-      encoding: 'utf8',
-      timeout: 20_000,
-    });
-    assert.equal(result.status, 37, `${result.stdout}\n${result.stderr}`);
-    assert.match(result.stderr, /Unsupported or invalid DSH version/i);
-  } finally {
-    blocker.close();
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test('supported 0.2.0 line variants pass the version gate and then require the Cookie bridge', async () => {
-  const settings = 'const persistence = ctx.remote.$host.isLoopback ? "host" : "memory";\n';
-  for (const version of ['0.2.0-rc.1', '0.2.0-alpha.1', '0.2.0']) {
-    const root = mkdtempSync(path.join(tmpdir(), 'dshpw-cli-020-'));
-    const dshRoot = makeAlpha3Root(root, settings, 'export class Connection {}\n', version);
-    const blocker = createServer();
-    await new Promise<void>((resolve) => blocker.listen(0, '0.0.0.0', resolve));
-    const port = (blocker.address() as AddressInfo).port;
-    try {
-      const result = spawnSync(process.execPath, [cli, 'serve-gateway'], {
-        cwd: projectRoot,
-        env: {
-          ...process.env,
-          DSH_PASSWORDS_ENV_FILE: writeConfig(root, dshRoot, {
-            MCP_GATEWAY_PORT: String(port),
-            MCP_GATEWAY_REDIRECT_PORT: '0',
-            MCP_DB_PATH: path.join(root, 'gateway.db'),
-          }),
-          LANG: 'en_US.UTF-8',
-        },
-        encoding: 'utf8',
-        timeout: 20_000,
-      });
-      assert.equal(result.status, 33, `${version}: ${result.stdout}\n${result.stderr}`);
-      assert.match(result.stderr, /Cookie bridge/i, version);
-    } finally {
-      blocker.close();
-      rmSync(root, { recursive: true, force: true });
-    }
-  }
-});
-
-test('unsupported 0.2.1 is rejected before patching or opening a listener', async () => {
-  const root = mkdtempSync(path.join(tmpdir(), 'dshpw-cli-021-'));
-  const settings = 'const persistence = ctx.remote.$host.isLoopback ? "host" : "memory";\n';
-  const dshRoot = makeAlpha3Root(root, settings, 'export class Connection {}\n', '0.2.1-rc.1');
-  const blocker = createServer();
-  await new Promise<void>((resolve) => blocker.listen(0, '0.0.0.0', resolve));
-  const port = (blocker.address() as AddressInfo).port;
-  try {
-    const result = spawnSync(process.execPath, [cli, 'serve-gateway'], {
-      cwd: projectRoot,
-      env: {
-        ...process.env,
-        DSH_PASSWORDS_ENV_FILE: writeConfig(root, dshRoot, {
-          MCP_GATEWAY_PORT: String(port),
-          MCP_GATEWAY_REDIRECT_PORT: '0',
-          MCP_DB_PATH: path.join(root, 'gateway.db'),
-        }),
-        LANG: 'en_US.UTF-8',
-      },
-      encoding: 'utf8',
-      timeout: 20_000,
-    });
-    assert.equal(result.status, 37, `${result.stdout}\n${result.stderr}`);
-    assert.match(result.stderr, /Unsupported or invalid DSH version/i);
-  } finally {
-    blocker.close();
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test('supported historical prereleases below the old bridge anchors still require the bridge', async () => {
-  const settings = 'const persistence = ctx.remote.$host.isLoopback ? "host" : "memory";\n';
-  // 这些版本仍在支持的 minor 线内；统一门禁策略要求它们也必须具备 Cookie bridge。
-  const ungated = ['0.1.2-alpha.2.1', '0.1.5-alpha.3'];
-  const blocker = createServer();
-  await new Promise<void>((resolve) => blocker.listen(0, '0.0.0.0', resolve));
-  const port = (blocker.address() as AddressInfo).port;
-  try {
-    for (const version of ungated) {
-      const root = mkdtempSync(path.join(tmpdir(), 'dshpw-cli-legacy-ungated-'));
-      const dshRoot = makeAlpha3Root(root, settings, 'export class Connection {}\n', version);
+    for (const version of versions) {
+      const root = mkdtempSync(path.join(tmpdir(), 'dshpw-cli-gate-'));
+      const dshRoot = makeDshRoot(root, settings, 'export class Connection {}\n', version);
       try {
         const result = spawnSync(process.execPath, [cli, 'serve-gateway'], {
           cwd: projectRoot,
@@ -400,8 +232,8 @@ test('supported historical prereleases below the old bridge anchors still requir
           encoding: 'utf8',
           timeout: 20_000,
         });
-        assert.equal(result.status, 33, `${version}: ${result.stdout}\n${result.stderr}`);
-        assert.match(result.stderr, /Cookie bridge/i, version);
+        assert.equal(result.status, 37, `${version}: ${result.stdout}\n${result.stderr}`);
+        assert.match(result.stderr, /Unsupported or invalid DSH version/i, version);
       } finally {
         rmSync(root, { recursive: true, force: true });
       }
@@ -413,11 +245,33 @@ test('supported historical prereleases below the old bridge anchors still requir
 
 test('gateway refuses startup when patch inspection throws', () => {
   const root = mkdtempSync(path.join(tmpdir(), 'dshpw-cli-patch-error-'));
-  const dshRoot = makeAlpha3Root(root, null, 'export class Connection {}\n');
+  const dshRoot = makeDshRoot(root, null, 'export class Connection {}\n');
   try {
     const result = startGateway(writeConfig(root, dshRoot));
     assert.equal(result.status, 36, `${result.stdout}\n${result.stderr}`);
     assert.match(result.stderr, /patch.*failed|EISDIR/i);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// `patch off` is the rollback escape hatch and must not be blocked by the identity gate:
+// a gateway that refuses the installed DSH version must still let the operator restore the
+// original bundle after .env / SETUP_KEY were removed. An unsupported version therefore
+// reaches rollbackPatch (here with no backup) instead of exiting 37.
+test('patch off rollback bypass is not blocked by the DSH identity gate', () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'dshpw-cli-patch-off-'));
+  const dshRoot = makeDshRoot(root, 'const persistence = "host";\n', 'export class Connection {}\n', '0.1.7');
+  try {
+    const result = spawnSync(process.execPath, [cli, 'patch', 'off'], {
+      cwd: projectRoot,
+      env: { ...process.env, DSH_PASSWORDS_ENV_FILE: writeConfig(root, dshRoot), LANG: 'en_US.UTF-8' },
+      encoding: 'utf8',
+      timeout: 20_000,
+    });
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stdout, /no-backup/);
+    assert.doesNotMatch(result.stdout + result.stderr, /Unsupported or invalid DSH version/i);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -17,7 +17,7 @@
   &nbsp;
   <a href="https://github.com/slywalker2006/dsh-passwords/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/slywalker2006/dsh-passwords/ci.yml?style=flat-square&label=CI" alt="CI"></a>
   &nbsp;
-  <a href="https://github.com/deepseek-ai/deepseek-harness"><img src="https://img.shields.io/badge/DSH-0.2.0--rc.1-4c6ef5?style=flat-square&labelColor=454a54" alt="DSH"></a>
+  <a href="https://github.com/deepseek-ai/deepseek-harness"><img src="https://img.shields.io/badge/DSH-0.2.1--alpha.1-4c6ef5?style=flat-square&labelColor=454a54" alt="DSH"></a>
   &nbsp;
   <img src="https://img.shields.io/badge/license-GPL--3.0-blue?style=flat-square" alt="License">
   &nbsp;
@@ -74,7 +74,7 @@
 
 ### 前置条件
 
-宿主机安装需要 Node.js 22.19+ 或 24+、可正常运行的 dsh 和 git。兼容门禁接受 DSH `0.1.7` 稳定版及其 alpha/beta/rc 预发布版本，并接受 `0.2.0` 线的稳定/预发布身份；当前开发树与 Docker 默认运行时锁定 `0.2.0-rc.1`；同时保留 `0.1.6` / `0.1.5` 全系列与 `0.1.2` / `0.1.3` 接口边界。测试服务器已部署并验证发布的 2.7.5（DSH `0.1.7-rc.2`）。Docker 安装只需要 Docker Engine 或 Docker Desktop 和一个 DeepSeek API key。
+宿主机安装需要 Node.js 22.19+ 或 24+、可正常运行的 dsh、git 与 pnpm（手动执行 `node scripts/register-plugin.mjs` 注册插件时需要；一键安装器会自动安装 pnpm）。兼容门禁只接受 DSH `0.2.1` patch 线，即 `>=0.2.1-alpha.1 <0.2.2-0`（alpha.1 起的预发布与稳定 0.2.1）；当前开发树与 bundled Docker 默认运行时锁定 `0.2.1-alpha.1`。已退役的 `0.1.x` / `0.2.0` 线、`0.2.1-alpha.0` 以及所有 `0.2.2+` 身份都会被拒绝。Docker 安装只需要 Docker Engine 或 Docker Desktop 和一个 DeepSeek API key。
 
 ### 安装
 
@@ -96,26 +96,32 @@ dsh-passwords install
 Windows 下载仓库里的 `install.bat` 双击运行。默认安装到 `%USERPROFILE%\dsh-passwords`。
 
 ```bash
-# 4. Docker
+# 4. Docker：一条命令完成安装并初始化
 docker run -d \
   --name dsh-passwords \
   --restart unless-stopped \
-  --env-file .env \
+  -e DEEPSEEK_API_KEY=sk-你的key \
+  -e SETUP_KEY=自己设定的强随机串 \
   -p 127.0.0.1:3088:3088 \
   -v dsh-home:/data/dsh \
   -v dsh-passwords-state:/data/dsh-passwords \
-  skywalker237234/dsh-passwords:2.7.6
+  skywalker237234/dsh-passwords:2.7.7
 ```
 
-`.env` 至少包含 `DEEPSEEK_API_KEY`。`MCP_GATEWAY_PUBLIC_HOST` 建议填实际访问的域名。宿主端口只发布在回环地址 `127.0.0.1:3088`，容器内监听 `0.0.0.0:3088`；公网访问由 nginx 或 Caddy 终结 TLS 后转发。镜像内置 DSH `0.2.0-rc.1`（DSH 0.2.0 线当前锁定版本；该镜像尚未做运行验收）；初始化完成以 healthz/readyz 均返回 `ok:true` 为准。
+启动后浏览器打开 `http://127.0.0.1:3088`，用你自己设置的 `SETUP_KEY` 完成首次配置。若省略 `-e SETUP_KEY`，容器会随机生成密钥并写入卷内 `setup-key.txt`，用 `docker exec dsh-passwords cat /data/dsh-passwords/setup-key.txt` 读取后再完成首次配置（首次配置成功后该文件自动删除）。`-e SETUP_KEY` 会在首次初始化时作为初始 SETUP_KEY 写入卷内 `.env`，不会与随机值分叉，去掉该 env 重启也不会因此锁死（首次配置成功后 `.env` 中的 SETUP_KEY 会按既有加固流程自动轮换，此后登录使用你创建的账号密码，不再需要它）。
+
+如需自定义端口、域名、SSH 端点或第三方端点登记等高级配置，可复制 `docker/.env.example` 为 `docker/.env` 并追加 `--env-file docker/.env`（Docker Compose 则可 `docker compose --env-file docker/.env -f docker/docker-compose.yml up -d`）；它是可选的进阶配置，不再是安装前置步骤。不要用仓库根目录的宿主机模板 `.env.example`：它会注入占位 `SETUP_KEY`（`change-me-…`）、`MCP_GATEWAY_PORT=443` 与空的 `MCP_GATEWAY_AUTO_TLS=`，覆盖镜像内置的 `3088` 端口和 `MCP_GATEWAY_AUTO_TLS=0`，导致容器不监听 `3088`、网关拒绝启动；其中相对的 `MCP_DB_PATH=./data/platform.db` 也会偏离容器默认的 `/data/dsh-passwords/platform.db`。
+
+Docker 部署至少需要 `DEEPSEEK_API_KEY`。`MCP_GATEWAY_PUBLIC_HOST` 建议填实际访问的域名。宿主端口只发布在回环地址 `127.0.0.1:3088`，容器内监听 `0.0.0.0:3088`；公网访问由 nginx 或 Caddy 终结 TLS 后转发。镜像内置 DSH `0.2.1-alpha.1`（DSH 0.2.1 patch 线当前锁定版本；该镜像尚未做运行验收）；初始化完成以 healthz/readyz 均返回 `ok:true` 为准。
 
 说明：
 
 - 宿主机安装默认目录为 `/opt/dsh-passwords`，可用 `DSH_PASSWORDS_DIR` 更改；检测到已有 dsh-passwords 目录时就地幂等重跑，其他同名目录会报错退出
-- SETUP_KEY 打印在安装结束时，同时写入安装目录的 `setup-key.txt`
+- SETUP_KEY：宿主机安装结束时打印并写入安装目录的 `setup-key.txt`；Docker 用 `-e SETUP_KEY` 指定，省略则随机生成并写入卷内 `setup-key.txt`
 - Docker 的两个命名卷分别存 dsh profile 与 `.env`、数据库、证书；删除即丢数据
 - Docker 中的“保命技能”不会尝试在容器内自删；Compose 部署需要彻底清理时，在宿主机执行 `docker compose down -v`，而 `docker run` 部署需要先 `docker rm -f dsh-passwords`，再执行 `docker volume rm dsh-home dsh-passwords-state`（都会永久删除卷数据）
-- 分容器部署时给 dsh 容器加 `MCP_DSH_PATCH_ALLOW_BIND_ALL=1`，让网关容器能访问 dsh web
+- 分容器部署时给 dsh 容器加 `MCP_DSH_PATCH_ALLOW_BIND_ALL=1`，让网关容器能访问 dsh web；`0.2.1-alpha.1` 的 `dsh-web-app` 仍然在启动时拒绝 `--host 0.0.0.0`，所以该子补丁依旧需要保留
+- npm 全局安装（方式 3）：Unix 首次安装需要 `sudo`（自动 HTTPS 要监听 80/443）；`nvm` / Homebrew 管理的 Node 常不在 root 或系统 PATH 中，可能找不到 `dsh-passwords` 命令；npm 全局目录会随包更新被替换，不适合长期保存 `.env` 与 `data/`，推荐 clone 后安装，或用 `DSH_PASSWORDS_ENV_FILE` 把配置与数据指向稳定目录
 
 ### 首次配置
 
@@ -125,7 +131,7 @@ docker run -d \
 
 首次配置成功后 `setup-key.txt` 自动删除，`.env` 中的密钥自动固化并轮换。
 
-Docker 用户需要先用 nginx 或 Caddy 把 80/443 反代到 `http://127.0.0.1:3088`；一次性 SETUP_KEY 用 `docker exec dsh-passwords cat /data/dsh-passwords/setup-key.txt` 读取。
+Docker 用户一条命令启动后直接打开 `http://127.0.0.1:3088` 完成首次配置，公网访问再自行用 nginx 或 Caddy 把 80/443 反代到 `http://127.0.0.1:3088`；首次配置用的 SETUP_KEY 就是 `-e SETUP_KEY` 设置的值，省略时用 `docker exec dsh-passwords cat /data/dsh-passwords/setup-key.txt` 读取。
 
 ## 卸载
 
@@ -203,26 +209,31 @@ node scripts/start-http.mjs [端口]    # 默认 8080，需确认风险提示
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `SETUP_KEY` | 安装脚本生成 | 首次配置密钥，配置成功后自动轮换 |
+| `SETUP_KEY` | 安装脚本生成（Docker 可用 `-e SETUP_KEY` 指定） | 首次配置密钥，配置成功后自动轮换 |
 | `MCP_JWT_SECRET` | 从 SETUP_KEY 派生 | 会话签名密钥，生产环境建议 `openssl rand -hex 32` 独立设置 |
-| `MCP_DB_PATH` | `./data/platform.db` | SQLite 数据库路径 |
+| `MCP_INTERNAL_SECRET` | 从 SETUP_KEY 派生 | 网关内部管理接口密钥（dsh 插件通知网关用），与 JWT 域分离派生；显式设置后不要随意更换 |
+| `MCP_DB_PATH` | 宿主 `./data/platform.db`；Docker `/data/dsh-passwords/platform.db` | SQLite 数据库路径；相对路径锚定 `.env` 所在目录（`DSH_PASSWORDS_ENV_FILE` 指向的目录），而非进程工作目录 |
 | `MCP_DB_ENC_KEY` | 空 | 字段加密密钥，启用后不可更换；备份数据库必须连同 `.env` |
-| `MCP_GATEWAY_HOST` / `MCP_GATEWAY_PORT` | `0.0.0.0` / `443` | 网关监听地址与端口 |
+| `MCP_GATEWAY_HOST` / `MCP_GATEWAY_PORT` | `0.0.0.0` / 宿主自动 HTTPS `443`、HTTP 模式 `8080`、Docker `3088` | 网关监听地址与端口；Docker 镜像固定 `0.0.0.0:3088`，再由宿主机映射到 `127.0.0.1:3088` |
 | `MCP_GATEWAY_UPSTREAM` | `http://127.0.0.1:3080` | dsh 网页地址，插件自动指向 |
+| `MCP_GATEWAY_UPSTREAM_TLS_VERIFY` | 开 | 上游 dsh 为 HTTPS/WSS 时校验其证书；`0` 关闭（仅调试，勿用于生产） |
 | `MCP_GATEWAY_SSH_ENDPOINTS` | 空 | 传统、无法由 DSH 运行时登记的 HTTP/WS 端点表（逗号分隔）。规则为 `[owner:][ws:\|http:]路径`；`owner:` 仅主用户，普通规则也仅主用户可用，历史 `allowSsh` 值不能授予子用户 SSH 能力。已加载 DSH 普通扩展的 Remote/API 面按通用清单适配，不绑定 `allow_ssh`；工作区/会话对象权限以及 terminal、动态宿主执行、插件管理等敏感边界仍由网关统一控制。使用 `DSH_PASSWORDS_ENV_FILE` 启动时，登记表每 5 秒热更新；未显式指定该变量时请重启网关生效。 |
-| `MCP_GATEWAY_REDIRECT_PORT` | `80` | ACME 验证与 301 跳转端口 |
+| `MCP_GATEWAY_REDIRECT_PORT` | 自动 HTTPS 时 `80`；关闭自动 HTTPS 时不监听 | ACME 验证与 301 跳转端口；显式 `0` 关闭 |
 | `MCP_GATEWAY_DOMAIN` | 空 | 自定义域名，留空用 `<公网IP>.sslip.io` |
-| `MCP_GATEWAY_AUTO_TLS` | 开 | `0` 关闭自动 HTTPS |
+| `MCP_GATEWAY_AUTO_TLS` | 宿主机开；Docker 镜像固定 `0` | `0` 关闭自动 HTTPS（容器内默认明文，由外层反代终结 TLS） |
 | `MCP_GATEWAY_TLS_CERT` / `MCP_GATEWAY_TLS_KEY` | 空 | 自有证书，优先于自动 HTTPS |
 | `MCP_GATEWAY_PUBLIC_HOST` | 空 | 固定跳转地址，防 Host 伪造 |
 | `MCP_GATEWAY_ACME_EMAIL` / `MCP_GATEWAY_ACME_STAGING` | 空 / 关 | 证书提醒邮箱 / LE 测试环境 |
 | `MCP_DSH_ROOT` | 自动探测 | dsh 安装目录 |
+| `MCP_DSH_SETTINGS_FILE` | 自动探测 | dsh `settings.yaml` 路径，网关与 dsh 不在同一台机器时显式指定；留空按 `DSH_HOME/settings.yaml` 等候选位置探测 |
 | `MCP_DSH_RESTART_SERVICE` | Linux `dsh-web`；Windows 空 | 重载补丁后的 systemd 服务名；Windows 自动更新安装后需手动重启 DeepSeek Harness |
 | `MCP_DSH_AUTO_UPDATE` | 开 | 部署级自动更新总开关 |
 | `MCP_DSH_UPDATE_MAX_BPS` | 1MiB/s | 自动下载限速，只能调低 |
 | `MCP_DSH_DOCKER_SELF_UPDATE` / `_COMPOSE_DIR` / `_COMPOSE_FILE` / `_IMAGE` / `_SOCKET` | 关 / 空 | Docker 应用内更新的启用开关与 Compose 配置 |
-| `MCP_DSH_PATCH_ALLOW_BIND_ALL` | 关 | 分容器拓扑允许 dsh web 绑定 0.0.0.0 |
+| `MCP_DSH_PATCH_ALLOW_BIND_ALL` | 关 | 分容器拓扑允许 dsh web 绑定 0.0.0.0（`0.2.1-alpha.1` 的 `dsh-web-app` 仍未原生放行，仍需该子补丁） |
 | `DSH_PASSWORDS_ENV_FILE` | 空 | 手动指定 `.env` 路径 |
+
+环境变量与 `.env` 的优先级按安装方式不同：Docker 内以容器环境变量（`--env-file docker/.env`）优先于卷内 `.env`；宿主安装相反，部署 `.env` 中的托管键优先于进程中继承的同名环境变量。
 
 ## 常用命令
 
@@ -317,7 +328,7 @@ curl -so /dev/null -w "TLS:%{time_appconnect}s\n" https://地址/gateway/login
 
 ### 手动安装
 
-> 当前发布版本 2.7.6 支持 DSH `0.1.7` 稳定版及其 alpha/beta/rc 预发布版本，并兼容 `0.2.0` 线；开发与 bundled Docker 运行时锁定 `0.2.0-rc.1`，并保留 `0.1.6` / `0.1.5` 全系列与 `0.1.2` / `0.1.3` 接口边界。2.7.6 已完成本地 Windows 与测试服务器验证。宿主机安装器会检查 Node.js `22.19+` 或 `24+`，注册插件并应用兼容补丁。
+> 当前发布版本 2.7.7 只支持 DSH `0.2.1` patch 线（`>=0.2.1-alpha.1 <0.2.2-0`）；开发与 bundled Docker 运行时锁定 `0.2.1-alpha.1`。已退役的 `0.1.x` / `0.2.0` 线、`0.2.1-alpha.0` 以及所有 `0.2.2+` 身份都会被版本门禁拒绝。宿主机安装器会检查 Node.js `22.19+` 或 `24+`，注册插件并应用兼容补丁。
 
 1. `git clone https://github.com/slywalker2006/dsh-passwords && cd dsh-passwords`
 2. `npm install && npm run build`
@@ -344,7 +355,7 @@ curl -so /dev/null -w "TLS:%{time_appconnect}s\n" https://地址/gateway/login
 
 ## 版本兼容
 
-当前发布版本为 2.7.6，开发与 bundled Docker 默认运行时锁定 `0.2.0-rc.1`：这是 npm 上 `0.2.0` 线当前唯一已发布的身份，也是 9 个 `@deepseek-ai/dsh*` 开发依赖实际解析并锁定的版本。开发依赖声明范围 `>=0.2.0-alpha.0 <0.2.1-0`，即接受 `0.2.0-alpha.0` 起的 alpha/beta/rc 预发布与稳定 `0.2.0`，拒绝 `0.1.7` 与 `0.2.1` 线；但 npm 尚未发布任何 `0.2.0` alpha/beta 包，因此 alpha 兼容仅由 SemVer 范围与版本身份门禁保证，未在实机运行、也未通过完整网关验收。DSH 基线目标为 0.1.7 线，兼容门禁继续接受稳定版及 alpha/beta/rc 预发布版本，并接受 `0.2.0` 线；同时保留对 DSH `0.1.6` / `0.1.5` 全系列及 `0.1.2`、`0.1.3` 接口边界的兼容验证目标。
+当前发布版本为 2.7.7，开发与 bundled Docker 默认运行时锁定 `0.2.1-alpha.1`：这是 npm 上 `0.2.1` patch 线当前最新已发布的身份（`alpha` dist-tag），也是 9 个 `@deepseek-ai/dsh*` 开发依赖实际解析并锁定的版本。开发依赖声明范围 `>=0.2.1-alpha.1 <0.2.2-0`，即接受 alpha.1 起的 alpha/beta/rc 预发布与稳定 `0.2.1`，拒绝已退役的 `0.1.x` / `0.2.0` 线、`0.2.1-alpha.0` 与所有 `0.2.2+` 身份；但 npm 目前只发布了 `0.2.1-alpha.1` 一个 0.2.1 身份，因此后续预发布与稳定版的兼容仅由 SemVer 范围与版本身份门禁保证，未在实机运行、也未通过完整网关验收。
 
 ## 参与贡献
 

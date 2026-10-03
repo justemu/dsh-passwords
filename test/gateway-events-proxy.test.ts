@@ -135,8 +135,13 @@ before(async () => {
         { rpcId: 'sse-workspace-changed', payload: { type: 'host/workspace-changed', workspace: { workspaceId: 'sse-workspace', path: '/work/sse', title: 'SSE', sessionIds: ['sse-session'], createdAt: '2026-08-28T00:00:00.000Z', updatedAt: '2026-08-28T00:00:00.000Z' } } },
         { rpcId: 'unknown-type', payload: { type: 'host/unknown', path: '/work/hidden' } },
         { rpcId: 'malformed-payload', payload: '/work/hidden' },
+        { rpcId: 'utf8-visible', payload: { type: 'host/session-status', sessionId: 'visible-session', running: true, note: 'emoji-😀-中文' } },
       ];
-      const payload = frames.map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join('');
+      // 末尾追加一个以裸 CR 结束注释行、随后给出隐藏会话事件的帧：过滤若不按 SSE
+      // 行语义（CR/LF/CRLF）解析 data 行，整帧会被放行而导致 hidden-session 泄露。
+      const payload =
+        frames.map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join('') +
+        `: comment\rdata: ${JSON.stringify({ rpcId: 'cr-comment-hidden', payload: { type: 'host/session-added', sessionId: 'hidden-session', cwd: '/work/hidden' } })}\r\r`;
       res.writeHead(200, { 'content-type': 'text/event-stream' });
       const hold = heldStreamId(req);
       if (hold !== null) {
@@ -145,8 +150,11 @@ before(async () => {
         res.write(payload);
         return;
       }
-      res.write(payload.slice(0, 37));
-      res.end(payload.slice(37));
+      // 故意在 emoji 的 UTF-8 字节序列中间切开：逐 chunk 无状态解码会在此产生 U+FFFD。
+      const payloadBuffer = Buffer.from(payload, 'utf8');
+      const splitAt = payloadBuffer.indexOf(Buffer.from('😀', 'utf8')) + 1;
+      res.write(payloadBuffer.subarray(0, splitAt));
+      res.end(payloadBuffer.subarray(splitAt));
       return;
     }
     if (req.url?.startsWith('/api/events.mux')) {
@@ -159,8 +167,12 @@ before(async () => {
         { rpcId: 'mux-queue-visible', payload: { type: 'session/queue', sessionId: 'visible-session', items: [] } },
         { rpcId: 'mux-sse', payload: { type: 'session/event', sessionId: 'sse-session', event: { id: 'e3' } } },
         { rpcId: 'mux-error', payload: { type: 'stream/error', error: { message: 'boom' } } },
+        { rpcId: 'utf8-mux-visible', payload: { type: 'session/event', sessionId: 'visible-session', event: { id: 'e-中文' } } },
       ];
-      const payload = frames.map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join('');
+      // 同 host：裸 CR 注释行后跟隐藏会话事件，验证 mux 过滤同样按 SSE 行语义解析。
+      const payload =
+        frames.map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join('') +
+        `: comment\rdata: ${JSON.stringify({ rpcId: 'cr-comment-hidden-mux', payload: { type: 'session/event', sessionId: 'hidden-session', event: { id: 'e-cr' } } })}\r\r`;
       res.writeHead(200, { 'content-type': 'text/event-stream' });
       const hold = heldStreamId(req);
       if (hold !== null) {
@@ -169,8 +181,11 @@ before(async () => {
         res.write(payload);
         return;
       }
-      res.write(payload.slice(0, 25));
-      res.end(payload.slice(25));
+      // 故意在中文的 UTF-8 字节序列中间切开，验证跨 chunk 多字节字符不被替换。
+      const payloadBuffer = Buffer.from(payload, 'utf8');
+      const splitAt = payloadBuffer.indexOf(Buffer.from('中', 'utf8')) + 1;
+      res.write(payloadBuffer.subarray(0, splitAt));
+      res.end(payloadBuffer.subarray(splitAt));
       return;
     }
     res.writeHead(200, { 'content-type': 'application/json' });
@@ -270,6 +285,36 @@ test('Issue #20: mux 只透传已授权会话事件，stream/error 与隐藏会�
   assert.equal(response.status, 200);
   assert.doesNotMatch(response.body, /mux-hidden|mux-subscribed-hidden|mux-approval-hidden|mux-error/);
   assert.match(response.body, /mux-visible|mux-subscribed-visible|mux-queue-visible/);
+});
+
+test('Issue #20: 裸 CR 注释后的隐藏 host 事件仍被过滤', async () => {
+  await request('/api/workspace.list', userCookie);
+  const response = await request('/api/events.host', userCookie);
+  // 无过滤时该帧（注释行 + 裸 CR + data 行）会整帧放行，泄露 hidden-session。
+  assert.doesNotMatch(response.body, /cr-comment-hidden/);
+  assert.doesNotMatch(response.body, /hidden-session/);
+  assert.match(response.body, /visible-session/);
+});
+
+test('Issue #20: 裸 CR 注释后的隐藏 mux 事件仍被过滤', async () => {
+  await request('/api/workspace.list', userCookie);
+  const response = await request('/api/events.mux', userCookie);
+  assert.doesNotMatch(response.body, /cr-comment-hidden-mux/);
+  assert.match(response.body, /mux-visible/);
+});
+
+test('Issue #20: 跨 chunk 的多字节 UTF-8 字符在 host 过滤后不被替换', async () => {
+  await request('/api/workspace.list', userCookie);
+  const response = await request('/api/events.host', userCookie);
+  assert.match(response.body, /emoji-😀-中文/);
+  assert.doesNotMatch(response.body, /\uFFFD/);
+});
+
+test('Issue #20: 跨 chunk 的多字节 UTF-8 字符在 mux 过滤后不被替换', async () => {
+  await request('/api/workspace.list', userCookie);
+  const response = await request('/api/events.mux', userCookie);
+  assert.match(response.body, /e-中文/);
+  assert.doesNotMatch(response.body, /\uFFFD/);
 });
 
 test('Issue #20: 未建立快照前敏感事件一律 fail-closed 丢弃', async () => {

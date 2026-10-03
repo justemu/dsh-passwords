@@ -17,7 +17,7 @@
   &nbsp;
   <a href="https://github.com/slywalker2006/dsh-passwords/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/slywalker2006/dsh-passwords/ci.yml?style=flat-square&label=CI" alt="CI"></a>
   &nbsp;
-  <a href="https://github.com/deepseek-ai/deepseek-harness"><img src="https://img.shields.io/badge/DSH-0.2.0--rc.1-4c6ef5?style=flat-square&labelColor=454a54" alt="DSH"></a>
+  <a href="https://github.com/deepseek-ai/deepseek-harness"><img src="https://img.shields.io/badge/DSH-0.2.1--alpha.1-4c6ef5?style=flat-square&labelColor=454a54" alt="DSH"></a>
   &nbsp;
   <img src="https://img.shields.io/badge/license-GPL--3.0-blue?style=flat-square" alt="License">
   &nbsp;
@@ -74,7 +74,7 @@
 
 ### Prerequisites
 
-Host installs need Node.js 22.19+ or 24+, a working dsh installation, and git. The compatibility gate accepts stable DSH `0.1.7` and its alpha/beta/rc prereleases, and also accepts the `0.2.0` line; the current working tree pins development and bundled Docker to `0.2.0-rc.1`. Compatibility targets also retain the full `0.1.6` / `0.1.5` lines and the `0.1.2` / `0.1.3` API boundaries. The published 2.7.5 deployment (DSH `0.1.7-rc.2`) has been validated on the test server. Docker installs only need Docker Engine or Docker Desktop and a DeepSeek API key.
+Host installs need Node.js 22.19+ or 24+, a working dsh installation, git, and pnpm (required by the manual `node scripts/register-plugin.mjs` registration step; the one-liner installer installs pnpm automatically). The compatibility gate accepts only the DSH `0.2.1` patch line, `>=0.2.1-alpha.1 <0.2.2-0` (prereleases from alpha.1 up plus stable 0.2.1); the current working tree pins development and bundled Docker to `0.2.1-alpha.1`. The retired `0.1.x` / `0.2.0` lines, `0.2.1-alpha.0`, and every `0.2.2+` identity are rejected. Docker installs only need Docker Engine or Docker Desktop and a DeepSeek API key.
 
 ### Install
 
@@ -96,26 +96,32 @@ dsh-passwords install
 On Windows download `install.bat` from the repository and run it. The default install directory is `%USERPROFILE%\dsh-passwords`.
 
 ```bash
-# 4. Docker
+# 4. Docker: one command completes install and initialization
 docker run -d \
   --name dsh-passwords \
   --restart unless-stopped \
-  --env-file .env \
+  -e DEEPSEEK_API_KEY=sk-your-key \
+  -e SETUP_KEY=your-own-strong-random-string \
   -p 127.0.0.1:3088:3088 \
   -v dsh-home:/data/dsh \
   -v dsh-passwords-state:/data/dsh-passwords \
-  skywalker237234/dsh-passwords:2.7.6
+  skywalker237234/dsh-passwords:2.7.7
 ```
 
-`.env` needs at least `DEEPSEEK_API_KEY`. Set `MCP_GATEWAY_PUBLIC_HOST` to the domain you actually use. The host publishes port `127.0.0.1:3088` only while the container listens on `0.0.0.0:3088`; terminate TLS on nginx or Caddy for public access. The image bundles DSH `0.2.0-rc.1` (the pinned release of the DSH 0.2.0 line; image runtime acceptance has not been performed for this pin); initialization is complete when healthz and readyz both return `ok:true`.
+Open `http://127.0.0.1:3088` in a browser and finish first-run setup with the `SETUP_KEY` you set. If you omit `-e SETUP_KEY`, the container generates a random key and writes it to `setup-key.txt` in the volume; read it with `docker exec dsh-passwords cat /data/dsh-passwords/setup-key.txt` before completing setup (the file is deleted automatically after setup succeeds). `-e SETUP_KEY` is written into the volume's `.env` as the initial SETUP_KEY on first initialization, so it never diverges from a random value and restarting without that env will not lock you out (after setup succeeds the SETUP_KEY in `.env` is rotated by the existing hardening flow; from then on you sign in with the account you created and no longer need it).
+
+For advanced configuration such as custom ports, domains, SSH endpoints or third-party endpoint registration, copy `docker/.env.example` to `docker/.env` and add `--env-file docker/.env` (for Docker Compose, `docker compose --env-file docker/.env -f docker/docker-compose.yml up -d`); it is optional advanced configuration, no longer an install prerequisite. Do not reuse the host template at the repository root (`.env.example`): it injects a placeholder `SETUP_KEY` (`change-me-…`), `MCP_GATEWAY_PORT=443`, and an empty `MCP_GATEWAY_AUTO_TLS=`, overriding the image's built-in port `3088` and `MCP_GATEWAY_AUTO_TLS=0` — the container then never listens on `3088` and the gateway refuses to start; its relative `MCP_DB_PATH=./data/platform.db` also drifts away from the container default `/data/dsh-passwords/platform.db`.
+
+A Docker deployment needs `DEEPSEEK_API_KEY` at minimum. Set `MCP_GATEWAY_PUBLIC_HOST` to the domain you actually use. The host publishes port `127.0.0.1:3088` only while the container listens on `0.0.0.0:3088`; terminate TLS on nginx or Caddy for public access. The image bundles DSH `0.2.1-alpha.1` (the pinned release of the DSH 0.2.1 patch line; image runtime acceptance has not been performed for this pin); initialization is complete when healthz and readyz both return `ok:true`.
 
 Notes:
 
 - Host installs default to `/opt/dsh-passwords`; override with `DSH_PASSWORDS_DIR`. A recognized existing dsh-passwords directory resumes the idempotent installer in place; another existing target aborts
-- The SETUP_KEY is printed when the install finishes and written to `setup-key.txt` in the install directory
+- SETUP_KEY: a host install prints it when the install finishes and writes it to `setup-key.txt` in the install directory; Docker users set it with `-e SETUP_KEY`, or let it be generated and written to `setup-key.txt` in the volume when omitted
 - The two Docker volumes hold the dsh profile and the `.env`, database and certificates; deleting them deletes your data
 - Emergency cleanup does not self-delete from inside Docker. For Compose deployments run `docker compose down -v`; for the documented `docker run` deployment, run `docker rm -f dsh-passwords` followed by `docker volume rm dsh-home dsh-passwords-state` (both permanently remove volume data)
-- For split-container deployments set `MCP_DSH_PATCH_ALLOW_BIND_ALL=1` on the dsh container so the gateway container can reach dsh web
+- For split-container deployments set `MCP_DSH_PATCH_ALLOW_BIND_ALL=1` on the dsh container so the gateway container can reach dsh web; `dsh-web-app` in `0.2.1-alpha.1` still rejects `--host 0.0.0.0` at startup, so this sub-patch is still required
+- npm global install (method 3): the first Unix install needs `sudo` (automatic HTTPS must bind 80/443); Node managed by `nvm` / Homebrew is often missing from root's or the system PATH, so the `dsh-passwords` command may not be found; the npm global directory is replaced on package updates and is a poor home for long-lived `.env` and `data/` — prefer a clone install, or point `DSH_PASSWORDS_ENV_FILE` at a stable directory
 
 ### First-run setup
 
@@ -125,7 +131,7 @@ Notes:
 
 After setup completes, `setup-key.txt` is deleted automatically and the keys in `.env` are consolidated and rotated.
 
-Docker users need nginx or Caddy to proxy 80/443 to `http://127.0.0.1:3088` first; read the one-time SETUP_KEY with `docker exec dsh-passwords cat /data/dsh-passwords/setup-key.txt`.
+Docker users open `http://127.0.0.1:3088` directly after the single command to complete first-run setup; for public access, proxy 80/443 to `http://127.0.0.1:3088` with nginx or Caddy yourself. The SETUP_KEY for setup is the value you passed to `-e SETUP_KEY`; when omitted, read it with `docker exec dsh-passwords cat /data/dsh-passwords/setup-key.txt`.
 
 ## Uninstall
 
@@ -203,26 +209,31 @@ Passwords require at least 12 characters with upper, lower, digit and symbol.
 
 | Variable | Default | Description |
 |---|---|---|
-| `SETUP_KEY` | Generated by installer | First-run setup key, rotated automatically after setup |
+| `SETUP_KEY` | Generated by the install script (Docker can set it with `-e SETUP_KEY`) | First-run setup key; rotated automatically after setup succeeds |
 | `MCP_JWT_SECRET` | Derived from SETUP_KEY | Session signing key; set independently with `openssl rand -hex 32` in production |
-| `MCP_DB_PATH` | `./data/platform.db` | SQLite database path |
+| `MCP_INTERNAL_SECRET` | Derived from SETUP_KEY | Gateway internal admin-API secret (used by the dsh plugin to notify the gateway), derived in a separate domain from the JWT; do not rotate it casually once set |
+| `MCP_DB_PATH` | Host `./data/platform.db`; Docker `/data/dsh-passwords/platform.db` | SQLite database path; a relative path is anchored to the directory of the `.env` (the `DSH_PASSWORDS_ENV_FILE` directory), not the process working directory |
 | `MCP_DB_ENC_KEY` | empty | Field encryption key; cannot be changed once set. Back up the database together with `.env` |
-| `MCP_GATEWAY_HOST` / `MCP_GATEWAY_PORT` | `0.0.0.0` / `443` | Gateway listen address and port |
+| `MCP_GATEWAY_HOST` / `MCP_GATEWAY_PORT` | `0.0.0.0` / host automatic HTTPS `443`, HTTP mode `8080`, Docker `3088` | Gateway listen address and port; the Docker image fixes `0.0.0.0:3088`, which the host maps to `127.0.0.1:3088` |
 | `MCP_GATEWAY_UPSTREAM` | `http://127.0.0.1:3080` | dsh web address, pointed automatically |
+| `MCP_GATEWAY_UPSTREAM_TLS_VERIFY` | on | Verify the upstream dsh certificate when it is HTTPS/WSS; `0` disables it (debugging only, never in production) |
 | `MCP_GATEWAY_SSH_ENDPOINTS` | empty | Registry for legacy HTTP/WS host endpoints that are not observable through the DSH runtime. Rules use `[owner:][ws:\|http:]path`; both `owner:` and ordinary SSH/host entries are owner-only; a legacy `allowSsh` value cannot grant subuser SSH access. Normal DSH extension surfaces registered by the host are synchronized through a generic runtime manifest and are available without endpoint registration or `allow_ssh`; workspace/session authorization and terminal, host-execution, and plugin-management boundaries remain enforced. When `DSH_PASSWORDS_ENV_FILE` is set, the registry is hot-reloaded every 5 seconds; otherwise restart the gateway after editing. |
-| `MCP_GATEWAY_REDIRECT_PORT` | `80` | ACME validation and 301 redirect port |
+| `MCP_GATEWAY_REDIRECT_PORT` | `80` with automatic HTTPS; not listening when it is off | ACME validation and 301 redirect port; an explicit `0` disables it |
 | `MCP_GATEWAY_DOMAIN` | empty | Custom domain; empty uses `<public IP>.sslip.io` |
-| `MCP_GATEWAY_AUTO_TLS` | on | `0` disables automatic HTTPS |
+| `MCP_GATEWAY_AUTO_TLS` | on for host installs; the Docker image fixes `0` | `0` disables automatic HTTPS (the container is plaintext by default, with an outer reverse proxy terminating TLS) |
 | `MCP_GATEWAY_TLS_CERT` / `MCP_GATEWAY_TLS_KEY` | empty | Your own certificate, takes precedence over automatic HTTPS |
 | `MCP_GATEWAY_PUBLIC_HOST` | empty | Fixed redirect target, guards against Host spoofing |
 | `MCP_GATEWAY_ACME_EMAIL` / `MCP_GATEWAY_ACME_STAGING` | empty / off | Renewal contact email / LE staging |
 | `MCP_DSH_ROOT` | auto-detected | dsh installation directory |
+| `MCP_DSH_SETTINGS_FILE` | auto-detected | Path to the dsh `settings.yaml`; set it explicitly when the gateway and dsh are not on the same machine. Empty probes candidates such as `DSH_HOME/settings.yaml` |
 | `MCP_DSH_RESTART_SERVICE` | Linux `dsh-web`; Windows empty | systemd service restarted after patch reload; on Windows, restart DeepSeek Harness manually after an update |
 | `MCP_DSH_AUTO_UPDATE` | on | Deployment-level auto-update master switch |
 | `MCP_DSH_UPDATE_MAX_BPS` | 1MiB/s | Automatic download throttle; can only be lowered |
 | `MCP_DSH_DOCKER_SELF_UPDATE` / `_COMPOSE_DIR` / `_COMPOSE_FILE` / `_IMAGE` / `_SOCKET` | off / empty | Docker in-app update switch and Compose settings |
-| `MCP_DSH_PATCH_ALLOW_BIND_ALL` | off | Allows dsh web to bind 0.0.0.0 for split-container topologies |
+| `MCP_DSH_PATCH_ALLOW_BIND_ALL` | off | Allows dsh web to bind 0.0.0.0 for split-container topologies (`dsh-web-app` in `0.2.1-alpha.1` still needs the sub-patch) |
 | `DSH_PASSWORDS_ENV_FILE` | empty | Explicit `.env` path |
+
+Environment-variable vs `.env` precedence differs by install method: in Docker the container environment (`--env-file docker/.env`) overrides the `.env` inside the volume; on a host install it is the opposite — managed keys in the deployment `.env` override same-named variables inherited by the process.
 
 ## Common commands
 
@@ -317,7 +328,7 @@ The bottleneck is usually the network path to the server.
 
 ## Manual install
 
-> Release 2.7.6 accepts stable DSH `0.1.7` and its alpha/beta/rc prereleases and also supports the `0.2.0` line, with development and bundled Docker pinned to `0.2.0-rc.1`; it retains compatibility targets for the full `0.1.6` / `0.1.5` lines and the `0.1.2` / `0.1.3` API boundaries. Release 2.7.6 has been checked locally on Windows and on the test server. The installer requires Node.js `22.19+` or `24+`, registers the plugin, detects dsh, and applies the compatibility patch.
+> Release 2.7.7 supports only the DSH `0.2.1` patch line (`>=0.2.1-alpha.1 <0.2.2-0`), with development and bundled Docker pinned to `0.2.1-alpha.1`. The retired `0.1.x` / `0.2.0` lines, `0.2.1-alpha.0`, and every `0.2.2+` identity are rejected by the version gate. The installer requires Node.js `22.19+` or `24+`, registers the plugin, detects dsh, and applies the compatibility patch.
 
 1. `git clone https://github.com/slywalker2006/dsh-passwords && cd dsh-passwords`
 2. `npm install && npm run build`
@@ -344,7 +355,7 @@ The UI is bilingual zh/en and follows the dsh language setting. The login page h
 
 ## Version compatibility
 
-Current release: 2.7.6. Development and bundled Docker default to the resolved runtime DSH `0.2.0-rc.1` — the only identity published on the npm `0.2.0` line so far, and the exact version the nine `@deepseek-ai/dsh*` dev dependencies resolve and lock to. The declared dev range is `>=0.2.0-alpha.0 <0.2.1-0`, which accepts `0.2.0-alpha.0` and later alpha/beta/rc prereleases plus stable `0.2.0`, and rejects `0.1.7` and the `0.2.1` line; because npm has published no `0.2.0` alpha/beta package, that alpha acceptance is only a SemVer-range and version-identity claim — no alpha build has been run or passed full gateway acceptance. The DSH compatibility gate accepts the stable 0.1.7 line and SemVer alpha/beta/rc prereleases, and also accepts the 0.2.0 line. Compatibility targets also retain the whole DSH `0.1.6` / `0.1.5` lines and the `0.1.2` / `0.1.3` API boundaries. The npm package ships prebuilt dist, TypeScript sources, and all scripts; Docker and npm are built from the same source revision.
+Current release: 2.7.7. Development and bundled Docker default to the resolved runtime DSH `0.2.1-alpha.1` — the latest identity published on the npm `0.2.1` patch line (the `alpha` dist-tag), and the exact version the nine `@deepseek-ai/dsh*` dev dependencies resolve and lock to. The declared dev range is `>=0.2.1-alpha.1 <0.2.2-0`, which accepts `0.2.1-alpha.1` and later alpha/beta/rc prereleases plus stable `0.2.1`, and rejects the retired `0.1.x` / `0.2.0` lines, `0.2.1-alpha.0`, and every `0.2.2+` identity; because npm has published only `0.2.1-alpha.1` on that line, accepting the later prereleases and the stable release is only a SemVer-range and version-identity claim — no `0.2.1` build has been run or passed full gateway acceptance. The npm package ships prebuilt dist, TypeScript sources, and all scripts; Docker and npm are built from the same source revision.
 
 ## Contributing
 

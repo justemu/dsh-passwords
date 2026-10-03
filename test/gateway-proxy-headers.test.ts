@@ -567,6 +567,21 @@ function startMockUpstream(): Promise<http.Server> {
             respond();
           }
         });
+      } else if (
+        /^\/api\/session[.\/](?:history|page)$/.test(req.url ?? '') &&
+        (req.headers['x-test-mode'] === 'raw-fallback-br' || req.headers['x-test-mode'] === 'raw-fallback-bad-json')
+      ) {
+        // 回归：上游以不支持的 content-encoding: br 或畸形 JSON 回带标记字符串。
+        // session/history 与 session/page 的隐藏 Unicode 清洗是强制项，网关必须
+        // fail-closed 502，绝不回放未清洗的上游原始体。
+        req.resume();
+        const marker = 'RAW-FALLBACK-MARKER';
+        const brMode = req.headers['x-test-mode'] === 'raw-fallback-br';
+        res.writeHead(200, {
+          'content-type': 'application/json',
+          ...(brMode ? { 'content-encoding': 'br' } : {}),
+        });
+        res.end(brMode ? marker : `not-json{${marker}`);
       } else if (/^\/api\/(?:session[.]page|subagents[.](?:prompt|interruptByParent))$/.test(req.url ?? '')) {
         const chunks: Buffer[] = [];
         req.on('data', (chunk: Buffer) => chunks.push(chunk));
@@ -1655,6 +1670,73 @@ test('D1 工作流：刚创建目录可登记、精确分配可登记、预存�
   }
 });
 
+test('权限：A 被分配父目录时不得伸进 B 拥有的子工作区子树（session/create 与 workspaceFiles 读取）', async () => {
+  // B 拥有子工作区 /workspaces/visible，A 只被分配其父目录 /workspaces。
+  // 归属判定必须是单向子树包含：等值只能在目标恰好等于 B 的工作区根时命中，
+  // /workspaces/visible/deep 这类深一层的目标会被漏放。
+  const owner = db.createUser('subtree-overlap-owner', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+  db.addUserWorkspace(owner.id, '/workspaces/visible');
+  const subUser = db.createUser('subtree-overlap-assignee', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+  db.setPermissions(subUser.id, {
+    allowedFolders: ['/workspaces'], hourlyTokenLimit: null, dailyMinutesLimit: null,
+    allowUpload: false, allowGitDownload: false, allowWorkspaceCreate: false,
+    allowedAgentPresets: null, banned: false, sandboxMode: null, disabledSessions: [],
+    allowedSessionIds: ['session-visible'],
+  });
+  db.markSessionGrantsSeeded(subUser.id);
+  const subCookie = `dsh_gateway_token=${jwt.sign({ sub: String(subUser.id), username: subUser.username, cv: 0 }, 'test-secret', { expiresIn: '12h' })}`;
+  const originalCookie = cookie;
+  const previousVisiblePath = remoteMuxBaselineVisiblePath;
+  cookie = subCookie;
+  // 会话根 = 被分配的父目录本身；只有目标伸进 B 的子工作区才命中子树包含。
+  remoteMuxBaselineVisiblePath = '/workspaces';
+  let connection: Awaited<ReturnType<typeof openRemoteMux>> | undefined;
+  const json = { 'content-type': 'application/json', cookie: subCookie };
+  const sessionCreate = (targetPath: string, rpcId: string) => gatewayReq('POST', '/api/session.create', json, JSON.stringify({
+    type: 'client-request', rpcId, method: 'session/create',
+    payload: { args: { request: { path: targetPath } } },
+  }));
+  const readBytes = (targetPath: string) => gatewayReq(
+    'POST', '/api/workspaceFiles/readBytes', json,
+    readBytesEnvelope('session-visible', targetPath, {}),
+  );
+  try {
+    connection = await openRemoteMux({ cookie: subCookie, origin: 'http://127.0.0.1', host: '127.0.0.1' });
+    connection.client.send(JSON.stringify({
+      type: 'open', streamId: 'subtree-overlap-baseline', endpoint: 'workspace/follow', payload: { args: {} },
+    }));
+    await nextFrameOrFail(connection, 'subtree overlap baseline');
+
+    // 1) 目标恰好等于 B 的工作区根：两条通道都必须拒绝。
+    assert.equal((await sessionCreate('/workspaces/visible', 'subtree-exact-create')).status, 403);
+    assert.equal((await readBytes('/workspaces/visible/secret.txt')).status, 403);
+
+    // 2) 目标位于 B 的子树深一层（等值判定会漏放）：必须同样拒绝，且不得到达上游。
+    const deepCreateBefore = lastUpstreamUrl;
+    assert.equal((await sessionCreate('/workspaces/visible/deep', 'subtree-deep-create')).status, 403);
+    assert.equal(lastUpstreamUrl, deepCreateBefore, '越权 session/create 不得到达上游');
+    const deepReadBefore = lastUpstreamUrl;
+    assert.equal((await readBytes('/workspaces/visible/deep/secret.txt')).status, 403);
+    assert.equal(lastUpstreamUrl, deepReadBefore, '越权 workspaceFiles 读取不得到达上游');
+
+    // 3) A 自己的兄弟路径在分配子树内且不属于任何他人工作区：保持可用。
+    assert.equal((await sessionCreate('/workspaces/a-sibling', 'subtree-sibling-create')).status, 200);
+    assert.equal((await readBytes('/workspaces/a-sibling/ok.txt')).status, 200);
+
+    if (process.platform === 'win32') {
+      const beforeAlias = lastUpstreamUrl;
+      assert.equal((await sessionCreate('/workspaces/Visible/deep', 'subtree-case-alias')).status, 403,
+        'Windows 上不同大小写拼法仍位于另一子用户工作区子树内');
+      assert.equal(lastUpstreamUrl, beforeAlias, '大小写别名不得把越权会话创建转发上游');
+    }
+  } finally {
+    remoteMuxBaselineVisiblePath = previousVisiblePath;
+    cookie = originalCookie;
+    connection?.client.close();
+    db.removeUserWorkspace(owner.id, '/workspaces/visible');
+  }
+});
+
 test('D1 工作流：孤儿所有权行（已删除用户残留）不阻断分配目录的可见性与登记', async () => {
   const subUser = db.createUser('d1-orphan-owner-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
   db.setPermissions(subUser.id, {
@@ -2153,6 +2235,23 @@ test('rc.1 session.search 成功响应结构异常时 fail-closed，不透传原
   } finally {
     sessionSearchResponseMode = originalMode;
     cookie = originalCookie;
+  }
+});
+
+test('session/history 与 session/page 解码/解析失败时 fail-closed 502，不回放未清洗内容', async () => {
+  // 隐藏 Unicode 清洗（history 还含受限子用户沙盒降级）是强制项；上游以不支持的
+  // content-encoding: br 或畸形 JSON 回带标记时，网关必须 502，绝不能让原始体到达客户端。
+  for (const endpoint of ['/api/session.history', '/api/session.page']) {
+    for (const mode of ['raw-fallback-br', 'raw-fallback-bad-json']) {
+      const response = await gatewayReq(
+        'POST',
+        endpoint,
+        { 'content-type': 'application/json', 'x-test-mode': mode },
+        JSON.stringify({ type: 'client-request', rpcId: `raw-fallback-${mode}`, method: 'session/history', payload: { args: {} } }),
+      );
+      assert.equal(response.status, 502, `${endpoint} ${mode}: ${response.body}`);
+      assert.ok(!response.body.includes('RAW-FALLBACK-MARKER'), `${endpoint} ${mode} 不得回放上游原始内容`);
+    }
   }
 });
 
@@ -3839,8 +3938,35 @@ test('普通第三方根级路径对子用户直接放行：注册 WS 通道不�
   const originalCookie = cookie;
   cookie = `dsh_gateway_token=${subToken}`;
   try {
-    const response = await gatewayReq('POST', '/plugin/ws/run', { origin: 'http://127.0.0.1' }, '{}');
+    const response = await gatewayReq('POST', '/plugin/ws/run', { origin: `http://127.0.0.1:${String(gatewayPort)}` }, '{}');
     assert.equal(response.status, 200, '普通第三方根级路径对子用户直接放行');
+  } finally {
+    cookie = originalCookie;
+  }
+});
+
+test('代理写请求拒绝恶意 Origin，同源请求仍转发', async () => {
+  const subUser = db.createUser('proxy-origin-guard-user', '$2a$10$dummyhashdummyhashdummyhashdu', 'user');
+  db.setPermissions(subUser.id, {
+    allowedFolders: [], hourlyTokenLimit: null, dailyMinutesLimit: null,
+    allowUpload: true, allowGitDownload: true, allowWorkspaceCreate: false,
+    banned: false, sandboxMode: null, disabledSessions: [],
+  });
+  const originalCookie = cookie;
+  cookie = `dsh_gateway_token=${jwt.sign({ sub: String(subUser.id), username: subUser.username, cv: 0 }, 'test-secret', { expiresIn: '12h' })}`;
+  try {
+    const before = lastUpstreamUrl;
+    const denied = await gatewayReq('POST', '/plugin/ws/run', {
+      origin: 'http://evil.example',
+      'content-type': 'application/x-www-form-urlencoded',
+    }, 'request=1');
+    assert.equal(denied.status, 403);
+    assert.equal(lastUpstreamUrl, before, 'cross-origin form write must not reach upstream');
+
+    const allowed = await gatewayReq('POST', '/plugin/ws/run', {
+      origin: `http://127.0.0.1:${String(gatewayPort)}`,
+    }, '{}');
+    assert.equal(allowed.status, 200);
   } finally {
     cookie = originalCookie;
   }

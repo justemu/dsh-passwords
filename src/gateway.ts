@@ -15,6 +15,7 @@ import path from 'node:path';
 import { createHmac, createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import { type Duplex, Transform } from 'node:stream';
+import { StringDecoder } from 'node:string_decoder';
 import zlib from 'node:zlib';
 import { URL, fileURLToPath } from 'node:url';
 import dns from 'node:dns';
@@ -687,20 +688,52 @@ function safeNext(next: string | undefined): string {
  * 主机:端口、不比协议——否则 nginx/caddy 在 80/443 终结 TLS 的反代部署
  * （网关收到明文 HTTP、req.protocol=http，浏览器 Origin=https）会全部误判。
  * Host 只信直接对端：仅当对端是本机回环（受信本地反代）才采纳 X-Forwarded-Host，
- * 公网直连请求不能带伪造头绕过。无 Origin（非浏览器/旧客户端）返回 true，
- * 由 HttpOnly+SameSite Cookie 兜底。
+ * 公网直连请求不能带伪造头绕过。配置的公开主机（gateway.domain/publicHost）是
+ * 服务端显式声明的信任来源：反代改写 Host 后 peer 可能非回环，但 Origin 命中配置
+ * 主机时仍须放行；该兜底只比对服务端配置、不读请求头，故不受 peer 回环与否限制。
+ * 无 Origin（非浏览器/旧客户端）返回 true，由 HttpOnly+SameSite Cookie 兜底。
  */
 type OriginRequest = {
+  method?: string;
+  url?: string;
   headers: {
     origin?: string | string[];
     host?: string | string[];
     'x-forwarded-host'?: string | string[];
+    'sec-fetch-site'?: string | string[];
   };
   socket: { remoteAddress?: string | null };
 };
 
 function firstHeader(value: string | string[] | undefined): string {
   return Array.isArray(value) ? value[0] ?? '' : value ?? '';
+}
+
+/**
+ * 同源校验拒绝时的诊断日志。只记录路由元数据（方法/路径/Host/Origin/对端），
+ * 绝不读取或记录 Cookie、Authorization、查询串——避免把凭据写进 journal。
+ */
+function logOriginRejection(req: OriginRequest, reason: string): void {
+  const clean = (value: string): string => value.replace(/[\r\n\t]/g, ' ').slice(0, 120);
+  const path = (req.url ?? '').split('?')[0] ?? '';
+  console.error(
+    '[dsh-passwords] origin-rejected reason=' +
+      clean(reason) +
+      ' method=' +
+      clean(req.method ?? '') +
+      ' path=' +
+      clean(path) +
+      ' peer=' +
+      clean(req.socket.remoteAddress ?? '') +
+      ' host=' +
+      clean(firstHeader(req.headers.host)) +
+      ' origin=' +
+      clean(firstHeader(req.headers.origin)) +
+      ' xfh=' +
+      clean(firstHeader(req.headers['x-forwarded-host'])) +
+      ' sfs=' +
+      clean(firstHeader(req.headers['sec-fetch-site'])),
+  );
 }
 
 function decodedQueryKey(rawKey: string): string | null {
@@ -749,18 +782,42 @@ function upstreamCookieHeader(browserCookie: string | undefined, authoritativeCo
   return kept.length === 0 ? undefined : kept.join('; ');
 }
 
-function originHostMatches(req: OriginRequest): boolean {
+function originHostMatches(req: OriginRequest, configuredHosts: readonly string[] = []): boolean {
   const originRaw = firstHeader(req.headers.origin);
   if (originRaw === '') return true;
+  // 字面量 `Origin: null` 无法被 new URL 解析，会落进 catch 误记为
+  // origin-unparsable；先显式分类为 origin-null，返回值仍为拒绝。
+  if (originRaw === 'null') {
+    logOriginRejection(req, 'origin-null');
+    return false;
+  }
   try {
     const origin = new URL(originRaw);
-    if (origin.origin === 'null') return false;
+    if (origin.origin === 'null') {
+      logOriginRejection(req, 'origin-null');
+      return false;
+    }
     const peer = req.socket.remoteAddress ?? '';
     const trustedProxy = peer === '127.0.0.1' || peer === '::1' || peer === '::ffff:127.0.0.1';
     const forwardedHost = firstHeader(req.headers['x-forwarded-host']).split(',')[0].trim();
     const effectiveHost = trustedProxy && forwardedHost !== '' ? forwardedHost : firstHeader(req.headers.host);
-    return origin.host === effectiveHost;
+    const normalizeHost = (value: string): string => {
+      const host = value.trim().toLowerCase();
+      if (origin.protocol === 'https:' && host.endsWith(':443')) return host.slice(0, -4);
+      if (origin.protocol === 'http:' && host.endsWith(':80')) return host.slice(0, -3);
+      return host;
+    };
+    const originHost = normalizeHost(origin.host);
+    if (originHost === normalizeHost(effectiveHost)) return true;
+    // 配置的公开主机是服务端显式声明的信任来源：反向代理可能把 Host 改写为内网
+    // 地址（peer 非回环），此时 Origin 仍在配置白名单内，必须放行。该兜底只比对
+    // 服务端配置值、不含任何请求头，故无需受 peer 是否回环限制；X-Forwarded-Host
+    // 的采纳仍限定回环 peer（见上）。
+    if (configuredHosts.some((host) => normalizeHost(host) === originHost)) return true;
+    logOriginRejection(req, 'host-mismatch');
+    return false;
   } catch {
+    logOriginRejection(req, 'origin-unparsable');
     return false;
   }
 }
@@ -769,6 +826,12 @@ function originHostMatches(req: OriginRequest): boolean {
 // 登录/配置表单：GET 渲染时下发 Cookie + 表单隐藏域同一随机值，
 // POST 时恒定时间比对。无服务端会话也能防跨站表单伪造。
 const CSRF_COOKIE = 'dsh_csrf';
+
+// P0 加固：签名段的服务端规范形式恒为 32 个小写十六进制字符
+// （newCsrfToken 用 createHmac(...).digest('hex').slice(0, 32)）。
+// 用严格白名单而不是字符串长度做前置判定，杜绝「32 个 JS 字符但 33 个字节」
+// 这类多字节变体绕过长度检查、进而在 timingSafeEqual 抛 RangeError。
+const CSRF_SIG_RE = /^[0-9a-f]{32}$/;
 
 function newCsrfToken(secret: string): string {
   // 签名双重提交：token 随机 + HMAC 签名。攻击者即使能自选 cookie 值
@@ -788,7 +851,12 @@ function csrfMatches(secret: string, cookieValue: string | null, fieldValue: str
   // 双重提交：cookie 与表单的 token 必须一致，且签名必须等于服务端 HMAC
   if (cookieToken.length === 0 || cookieToken !== fieldToken) return false;
   const expected = createHmac('sha256', secret).update(cookieToken).digest('hex').slice(0, 32);
-  if (expected.length !== cookieSig.length || expected.length !== fieldSig.length) return false;
+  // JS `.length` 是 UTF-16 码元数，Buffer/`timingSafeEqual` 用 UTF-8 字节数：
+  // 31 个 ASCII + U+00E9 是「32 码元 / 33 字节」，能骗过长度校验并让
+  // timingSafeEqual 抛 ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH。三个调用点都在
+  // async 路由内，Express 4 不接住 async 拒绝，异常会升级为未处理拒绝 → 进程退出。
+  // 因此改用与服务端签名完全一致的白名单：非 32 位小写十六进制一律拒绝。
+  if (!CSRF_SIG_RE.test(cookieSig) || !CSRF_SIG_RE.test(fieldSig)) return false;
   return (
     timingSafeEqual(Buffer.from(cookieSig), Buffer.from(fieldSig)) &&
     timingSafeEqual(Buffer.from(cookieSig), Buffer.from(expected))
@@ -803,6 +871,23 @@ function setCsrfCookie(res: Response, token: string, secure: boolean): void {
     }`,
   );
 }
+
+/**
+ * 未认证 / 幽灵会话时，浏览器与爬虫自动探测的精确路径。命中直接 204：不渲染
+ * 登录页、不重定向、不下发 cookie、不转发上游，避免匿名探测触发整页渲染与
+ * CSRF 轮换。只做精确 Set 匹配（绑定已归一化的 gatePath），刻意不改成前缀、
+ * 扩展名或 Sec-Fetch-Dest/Accept 判断，以免扩大匿名可达面。
+ */
+const ANONYMOUS_STATIC_PROBES: ReadonlySet<string> = new Set([
+  '/favicon.ico',
+  '/apple-touch-icon.png',
+  '/apple-touch-icon-precomposed.png',
+  '/manifest.json',
+  '/manifest.webmanifest',
+  '/browserconfig.xml',
+  '/robots.txt',
+  '/sitemap.xml',
+]);
 
 // ── 主题同步：合理化跟随 dsh 主题 ─────────────────────────────
 // dsh 的主题偏好持久化在 <dsh home>/settings.yaml 的 ui-theme.preference
@@ -1268,6 +1353,9 @@ export function createGatewayServer(
   options: { envFile?: string; endpointReloadIntervalMs?: number } = {},
 ): http.Server {
   const app = express();
+  const configuredOriginHosts = [config.gateway.domain, config.gateway.publicHost].filter(
+    (host): host is string => typeof host === 'string' && host.trim() !== '',
+  );
   // 宿主进程低频推送的已注册 Remote/HTTP 扩展面。已加载扩展不绑定 allow_ssh；
   // 官方 terminal、SSH 端点和宿主级敏感能力仍由各自边界控制。
   let dynamicPluginManifest: DynamicPluginManifest | undefined;
@@ -1445,11 +1533,14 @@ export function createGatewayServer(
   });
 
   // 登录/配置页安全响应头（仅 /gateway/* 自有页面；代理的 dsh 响应不强制
-  // CSP，避免破坏 dsh 前端）：禁嗅探、禁嵌入、无 Referrer、禁缓存、禁索引
+  // CSP，避免破坏 dsh 前端）：禁嗅探、禁嵌入、Referrer 仅同源、禁缓存、禁索引
   app.use('/gateway', (_req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'DENY');
-    res.setHeader('Referrer-Policy', 'no-referrer');
+    // 必须用 same-origin：no-referrer 会让真实同源 HTML 表单 POST 变为
+    // Origin: null + Sec-Fetch-Site: same-origin，被同源校验误判 403，
+    // 登录卡在 /gateway/login。same-origin 仍不向跨源泄露 Referer。
+    res.setHeader('Referrer-Policy', 'same-origin');
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('X-Robots-Tag', 'noindex, nofollow');
     // 网关标识：客户端插件探测此头判断是否经 dsh-passwords 远程访问
@@ -1909,11 +2000,10 @@ export function createGatewayServer(
  *  单向判定：共享的分配根下创建兄弟目录不受影响，只有伸进他人子树才拦；
  *  物主已被删除的孤儿行不构成冲突（无存活租户可保护）。 */
   const workspaceSubtreeOverlap = (userId: number, workspacePath: string): boolean => {
-    const candidate = canonicalizePathBestEffort(workspacePath);
     return workspaceOwnersSnapshot().some((owner) =>
       owner.userId !== userId &&
       db.getUserById(owner.userId)?.role === 'user' &&
-      pathWithin(candidate, canonicalizePathBestEffort(owner.path)),
+      pathWithinDeletedTree(workspacePath, owner.path),
     );
   };
 
@@ -1975,6 +2065,9 @@ export function createGatewayServer(
     // 单帧解析缓冲有界（见 SseFrameBuffer），上限与 WS 承载的单条消息上限同口径：
     // 上游不发空行时不能无界增长，同时不影响正常大小的事件帧。
     const frames = new SseFrameBuffer(REMOTE_MUX_MAX_PAYLOAD_BYTES);
+    // 按流维护解码状态：多字节 UTF-8 字符跨 Buffer 边界时先留在解码器里，避免被
+    // 逐 chunk 解码成 U+FFFD 替换字符而破坏过滤输出。
+    const decoder = new StringDecoder('utf8');
     const workspacePathAllowed = (candidate: string): boolean => {
       const currentPerms = db.getPermissions(userId) ?? perms;
       if (!folderAllowed(candidate, currentPerms.allowed_folders)) return false;
@@ -2001,7 +2094,9 @@ export function createGatewayServer(
       'host/remote-event',
     ]);
     const filterFrame = (frame: string): string => {
-      const normalized = frame.replace(/\r\n/g, '\n');
+      // 按 SSE 行语义归一化：CRLF、LF、裸 CR 都是行终止符，遗漏裸 CR 会把
+      // 「注释\rdata: 敏感事件」当成一行而跳过 data: 解析，导致敏感事件被整帧放行。
+      const normalized = frame.replace(/\r\n|\r|\n/g, '\n');
       const dataLines = normalized.split('\n').filter((line) => line.startsWith('data:'));
       if (dataLines.length === 0) return frame;
       let envelope: Record<string, unknown>;
@@ -2070,13 +2165,17 @@ export function createGatewayServer(
     };
     return new Transform({
       transform(chunk: Buffer, _encoding, callback) {
-        for (const frame of frames.push(chunk.toString('utf8'))) {
+        for (const frame of frames.push(decoder.write(chunk))) {
           const out = filterFrame(frame);
           if (out !== '') this.push(out);
         }
         callback();
       },
       flush(callback) {
+        for (const frame of frames.push(decoder.end())) {
+          const out = filterFrame(frame);
+          if (out !== '') this.push(out);
+        }
         for (const frame of frames.flush()) {
           const out = filterFrame(frame);
           if (out !== '') this.push(out);
@@ -2376,15 +2475,18 @@ export function createGatewayServer(
   }
   /**
    * 把一个只剩绝对路径的官方接口参数（/api/file 的 ?path=）绑回租户工作区：
-   * 必须落在某个「仍然授权的会话工作区根」内，且在文件夹白名单内、不属于其他
-   * 子用户创建的工作区。只在命中包含关系时才查 grant，避免逐请求全表扫描。
+   * 必须落在某个「仍然授权的会话工作区根」内，且在文件夹白名单内、不伸进其他
+   * 子用户创建的工作区子树。只在命中包含关系时才查 grant，避免逐请求全表扫描。
+   * 归属判定用单向子树（不是等值）：被分配了父目录 A 的子用户不能借白名单
+   * 停留在 /A，再读取 /A/B-child/sub 里物主 B 的内容——等值只在目标恰好等于
+   * B 的工作区根时命中，深一层就会漏放。
    */
   const pathBoundToAuthorizedWorkspace = (userId: number, perms: UserPermissionsRow, candidate: string): boolean => {
     const access = userSessionAccess.get(userId);
     if (access === undefined) return false;
     if (!folderAllowed(candidate, perms.allowed_folders) &&
         !folderAllowed(canonicalizePathBestEffort(candidate), perms.allowed_folders)) return false;
-    if (workspaceOwnedByAnotherSubuser(userId, candidate)) return false;
+    if (workspaceSubtreeOverlap(userId, candidate)) return false;
     for (const [sessionId, sessionRoot] of access) {
       // 词法与真实路径两种形态都做包含性比较：候选路径由请求方给出时（官方
       // /api/file?path=），调用方已对两种形态分别判定；这里同样不因别名/大小写/
@@ -2434,7 +2536,7 @@ export function createGatewayServer(
     const targetCanonical = canonicalizePathBestEffort(target);
     if (!pathWithin(target, root) || !pathWithin(targetCanonical, rootCanonical) ||
       !folderAllowed(target, perms.allowed_folders) || !folderAllowed(targetCanonical, perms.allowed_folders) ||
-      workspaceOwnedByAnotherSubuser(userId, target)) return null;
+      workspaceSubtreeOverlap(userId, target)) return null;
     return { scopeId: request.scopeId, root, target, rootCanonical, targetCanonical };
   };
   const sessionFollowSnapshotMatches = (address: NonNullable<ReturnType<typeof parseSessionAddress>>, value: unknown): boolean => {
@@ -2809,6 +2911,9 @@ export function createGatewayServer(
     // 单帧解析缓冲有界（见 SseFrameBuffer），上限与 WS 承载的单条消息上限同口径：
     // 上游不发空行时不能无界增长，同时不影响正常大小的事件帧。
     const frames = new SseFrameBuffer(REMOTE_MUX_MAX_PAYLOAD_BYTES);
+    // 按流维护解码状态：多字节 UTF-8 字符跨 Buffer 边界时先留在解码器里，避免被
+    // 逐 chunk 解码成 U+FFFD 替换字符而破坏过滤输出。
+    const decoder = new StringDecoder('utf8');
 
     const allowedSession = (sessionId: unknown): boolean => {
       const access = userSessionAccess.get(userId);
@@ -2821,7 +2926,9 @@ export function createGatewayServer(
     };
 
     const filterFrame = (frame: string): string => {
-      const normalized = frame.replace(/\r\n/g, '\n');
+      // 按 SSE 行语义归一化：CRLF、LF、裸 CR 都是行终止符，遗漏裸 CR 会把
+      // 「注释\rdata: 敏感事件」当成一行而跳过 data: 解析，导致敏感事件被整帧放行。
+      const normalized = frame.replace(/\r\n|\r|\n/g, '\n');
       const dataLines = normalized
         .split('\n')
         .filter((line) => line.startsWith('data:'));
@@ -2872,7 +2979,7 @@ export function createGatewayServer(
 
     return new Transform({
       transform(chunk: Buffer, _encoding, callback) {
-        for (const frame of frames.push(chunk.toString('utf8'))) {
+        for (const frame of frames.push(decoder.write(chunk))) {
           const out = filterFrame(frame);
           if (out !== '') this.push(out);
         }
@@ -2881,6 +2988,11 @@ export function createGatewayServer(
       },
 
       flush(callback) {
+        for (const frame of frames.push(decoder.end())) {
+          const out = filterFrame(frame);
+          if (out !== '') this.push(out);
+        }
+
         for (const frame of frames.flush()) {
           const out = filterFrame(frame);
           if (out !== '') this.push(out);
@@ -3021,8 +3133,14 @@ export function createGatewayServer(
       auth.isInitialized().catch(() => false),
       db.health().catch(() => false),
     ]);
-    // 每次渲染下发新 CSRF token（Cookie + 表单隐藏域）
-    const csrf = newCsrfToken(csrfSecret);
+    // Issue #35：favicon 等未认证子请求会被重定向回登录页并再次渲染，若无条件
+    // 轮换 token，原登录/首次配置表单里的隐藏域就会与 cookie 失配（403）。
+    // 因此仅在现有 cookie 无法通过双重提交校验时才换发新 token；有效则复用。
+    const existingCsrf = readCookie(req.headers.cookie, CSRF_COOKIE);
+    const csrf =
+      existingCsrf !== null && csrfMatches(csrfSecret, existingCsrf, existingCsrf)
+        ? existingCsrf
+        : newCsrfToken(csrfSecret);
     setCsrfCookie(res, csrf, config.gateway.tls !== null);
     // 显式 ?lang= 选择持久化到 cookie（语言切换链接点出来的）。
     // 注意 Set-Cookie 头已由 CSRF 占用，这里用数组追加而不是 setHeader 覆盖。
@@ -3054,6 +3172,15 @@ export function createGatewayServer(
   const SETUP_MAX_PER_WINDOW = 10;
 
   app.post('/gateway/setup', async (req, res) => {
+    // P2 加固：写操作必须同源。浏览器在跨源 POST 上总会带 Origin，这里与 Host 比对
+    // （仅回环反代才采纳 X-Forwarded-Host）；非浏览器客户端不带 Origin 时按原样放行，
+    // 因此不改变 CLI / 测试行为。这条堵住「子域 toss 一条合法 cookie 后从跨源页面
+    // 自动提交」的 cookie-tossing CSRF —— 与 logout、/api/dsh-passwords 写操作同一机制。
+    // 必须先于限速：否则跨源的连发请求会打满受害者 IP 的配额，令其无法完成首次配置。
+    if (!originHostMatches(req, configuredOriginHosts)) {
+      res.status(403).type('text/plain').send('403 Forbidden');
+      return;
+    }
     const ipKey = req.ip ?? '';
     const nowTs = Date.now();
     const recent = (setupAttempts.get(ipKey) ?? []).filter((t) => nowTs - t < SETUP_WINDOW_MS);
@@ -3116,6 +3243,11 @@ export function createGatewayServer(
   const LOGIN_SUCCESS_MAX_PER_MIN = 10;
 
   app.post('/gateway/login', async (req, res) => {
+    // P2 加固：写操作必须同源（理由见 POST /gateway/setup 处同一段注释）。
+    if (!originHostMatches(req, configuredOriginHosts)) {
+      res.status(403).type('text/plain').send('403 Forbidden');
+      return;
+    }
     const next = safeNext(typeof req.body?.next === 'string' ? req.body.next : undefined);
     const username = typeof req.body?.username === 'string' ? req.body.username : '';
     const password = typeof req.body?.password === 'string' ? req.body.password : '';
@@ -3196,7 +3328,7 @@ export function createGatewayServer(
   app.post('/gateway/logout', (req, res) => {
     // 同站子域页面可借表单强制登出（SameSite=Lax 只挡跨站、不挡同站子域）：
     // 与网关写路由同口径做 Origin 主机校验，提交方与 Host 不一致时拒绝。
-    if (!originHostMatches(req)) {
+    if (!originHostMatches(req, configuredOriginHosts)) {
       res.status(403).type('text/plain').send('403 Forbidden');
       return;
     }
@@ -3349,9 +3481,23 @@ export function createGatewayServer(
   const stringArray = (v: unknown, max = 64): string[] =>
     Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string').slice(0, max) : [];
 
-  // 统一 API 鉴权：跨站拒绝 + 会话校验 + 可选主用户门控
+  // 统一 API 鉴权：跨站拒绝 + 同站子域同源校验 + 会话校验 + 可选主用户门控
   const apiAuth = (req: Request, res: Response, requireAdmin = false) => {
+    // 兄弟子域 CSRF：Sec-Fetch-Site 只区分 cross-site，同站兄弟子域恒为 same-site；
+    // 且全局 express.urlencoded 允许无 CORS 预检的简单表单 POST，攻击者可在
+    // sibling.example.com 用纯 HTML 表单借受害者会话完成状态变更。对所有状态变更
+    // 方法补做 Origin vs Host 同源校验（与 setup/login/logout 同一口径）：浏览器
+    // 跨源写必带 Origin，子域与 Host 不等即拒绝；originHostMatches 对无 Origin 的
+    // 非浏览器/旧客户端返回 true（兼容性不变），并保留仅回环反代才采纳
+    // X-Forwarded-Host 的可信逻辑。GET/HEAD 等只读方法不改，也不波及有意跨源的路由。
+    const stateChanging = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method ?? '');
     if (req.headers['sec-fetch-site'] === 'cross-site') {
+      // host-mismatch 的拒绝已由 originHostMatches 记录；这里只补跨站标记这一来源。
+      logOriginRejection(req, 'sec-fetch-site-cross-site');
+      res.status(403).json({ ok: false, code: 'FORBIDDEN_CSRF', error: 'forbidden' });
+      return null;
+    }
+    if (stateChanging && !originHostMatches(req, configuredOriginHosts)) {
       res.status(403).json({ ok: false, code: 'FORBIDDEN_CSRF', error: 'forbidden' });
       return null;
     }
@@ -3399,6 +3545,7 @@ export function createGatewayServer(
     stringArray,
     nullableInt,
     effectivePermissions,
+    workspaceSubtreeOverlap,
     normalizeAllowedModels,
     parseAllowedModelSpec,
     verifyAdminPassword: (caller, password, meta) => auth.verifyAdminPassword(caller, password, meta),
@@ -3578,6 +3725,12 @@ export function createGatewayServer(
       }
       const user = sessionOf(req);
       if (!user) {
+        // Issue #35 / 审计 P3：自动探针路径（favicon、apple-touch-icon、manifest、
+        // robots 等）未认证时直接 204，不渲染也不重定向；其余路径照原样 302。
+        if (ANONYMOUS_STATIC_PROBES.has(gatePath)) {
+          res.status(204).end();
+          return;
+        }
         // 重定向兼容层：记录原始 URL，登录后跳回。根路径是默认落点，
         // 不在地址栏附带 next 参数（不把内部路由目标甩到公开 URL 上）；
         // 登录成功后 safeNext 缺省回首页。
@@ -3588,6 +3741,10 @@ export function createGatewayServer(
       }
       const row = db.getUserById(user.userId);
       if (!row) {
+        if (ANONYMOUS_STATIC_PROBES.has(gatePath)) {
+          res.status(204).end();
+          return;
+        }
         const original = req.originalUrl;
         const target = original === '/' ? '/gateway/login' : `/gateway/login?next=${encodeURIComponent(original)}`;
         res.redirect(302, target);
@@ -3611,7 +3768,7 @@ export function createGatewayServer(
         !requestPath.startsWith('/api/dsh-passwords/internal/') &&
         typeof req.headers.origin === 'string'
       ) {
-        if (!originHostMatches(req)) {
+        if (!originHostMatches(req, configuredOriginHosts)) {
           res.status(403).type('text/plain').send('403 Forbidden');
           return;
         }
@@ -3953,7 +4110,7 @@ export function createGatewayServer(
     OFFICIAL_ACCOUNT_REMOTE_ENDPOINTS,
     OFFICIAL_JOB_REMOTE_ENDPOINTS,
     OFFICIAL_TERMINAL_HTTP_RE,
-    originHostMatches,
+    originHostMatches: (req) => originHostMatches(req, configuredOriginHosts),
     parseRemoteMuxClientFrame,
     parseRemoteMuxServerFrame,
     pendingCreatedDirectoryPaths,

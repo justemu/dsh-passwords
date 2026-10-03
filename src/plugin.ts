@@ -713,12 +713,44 @@ function exchangeDshBrowserCookie(connection: unknown, baseUrl: string): Promise
   });
 }
 
+/** startGateway 的可注入运行时依赖：仅用于定向测试，生产走默认实现。 */
+export type GatewayLaunchRuntime = {
+  spawn: typeof spawn;
+  healthz: (cfg: PlatformConfig) => Promise<boolean>;
+  ownerPid: (cfg: PlatformConfig) => Promise<number | null>;
+  portFree: (port: number) => Promise<boolean>;
+  exchangeBrowserCookie: (connection: unknown, upstreamUrl: string) => Promise<UpstreamBrowserAuth>;
+  deploymentEnv: typeof deploymentGatewayEnv;
+  loadConfig: typeof loadConfig;
+};
+
+const defaultGatewayLaunchRuntime: GatewayLaunchRuntime = {
+  spawn,
+  healthz: gatewayHealthz,
+  ownerPid: gatewayOwnerPid,
+  portFree: waitForGatewayPortFree,
+  exchangeBrowserCookie: exchangeDshBrowserCookie,
+  deploymentEnv: deploymentGatewayEnv,
+  loadConfig,
+};
+
+/** 子进程是否仍被本插件持有（未退出、未报错）。 */
+function holdsLiveGatewayChild(child: ChildProcess | null): boolean {
+  return child !== null && child.exitCode === null && child.signalCode === null;
+}
+
 /**
  * 自动拉起外部密码门：dsh 启动时（本插件被加载）spawn 网关子进程，
  * 无需任何额外启动命令。dsh 退出时（ctx.dispose）子进程随停；
  * 网关侧另有父进程看门狗兜底（宿主被强杀时自己退出）。
+ * 导出供定向测试使用（生命周期只在 dsh 进程加载插件时生效）。
  */
-function startGateway(ctx: Context, cfg: PlatformConfig, explicitUpstream: string): void {
+export function startGateway(
+  ctx: Context,
+  cfg: PlatformConfig,
+  explicitUpstream: string,
+  runtime: GatewayLaunchRuntime = defaultGatewayLaunchRuntime,
+): void {
   const installRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
   const cliPath = path.join(installRoot, 'dist', 'cli.js');
   // dsh/systemd 可能已提供稳定的部署环境文件。npm 更新后插件模块目录会变成
@@ -761,10 +793,11 @@ function startGateway(ctx: Context, cfg: PlatformConfig, explicitUpstream: strin
       };
 
       const startCookiePolling = (): void => {
-        if (poll !== null || deriveDshBrowserCookie(connection, upstreamUrl) === undefined) return;
+        if (disposed || poll !== null || deriveDshBrowserCookie(connection, upstreamUrl) === undefined) return;
         poll = setInterval(() => {
           if (disposed || refreshInFlight !== null) return;
           refreshInFlight = probeGatewayBrowserCookie(cfg).then(async (healthy) => {
+            if (disposed) return false;
             if (healthy) return true;
             const refreshed = await refreshCookie();
             if (!refreshed) console.error('[dsh-passwords] 上游认证 Cookie 健康检查失败，且 alpha Host Cookie 刷新未成功');
@@ -806,15 +839,19 @@ function startGateway(ctx: Context, cfg: PlatformConfig, explicitUpstream: strin
       };
 
       const launch = async (): Promise<void> => {
-        if (disposed || launching || (child !== null && child.exitCode === null && child.signalCode === null)) return;
+        if (disposed || launching || holdsLiveGatewayChild(child)) return;
         launching = true;
         try {
           // 已经是本插件的健康网关时复用它；不能仅凭“端口可连接”就跳过，
           // 因为 dsh 重启时旧 child 可能正占着端口但即将退出。
-          if (await gatewayHealthz(cfg)) {
-            const ownerPid = await gatewayOwnerPid(cfg);
+          const healthy = await runtime.healthz(cfg);
+          if (disposed) return;
+          if (healthy) {
+            const ownerPid = await runtime.ownerPid(cfg);
+            if (disposed) return;
             if (ownerPid === process.pid) {
               const cookieReady = await refreshCookie();
+              if (disposed) return;
               if (!cookieReady) {
                 console.error('[dsh-passwords] 当前网关属于本 dsh，但上游 Cookie 刷新失败，暂不复用');
                 scheduleRetry();
@@ -826,29 +863,34 @@ function startGateway(ctx: Context, cfg: PlatformConfig, explicitUpstream: strin
             }
             console.error(`[dsh-passwords] 端口 ${String(gatewayPort)} 上存在旧/其他密码门实例，等待其释放后接管`);
           }
-          if (!(await waitForGatewayPortFree(gatewayPort))) {
+          const portFree = await runtime.portFree(gatewayPort);
+          if (disposed) return;
+          if (!portFree) {
             console.error(`[dsh-passwords] 密码门端口 ${String(gatewayPort)} 被非本插件进程占用，等待超时；未终止占用者，将稍后重试`);
             scheduleRetry();
             return;
           }
-          const browserAuth = await exchangeDshBrowserCookie(connection, upstreamUrl);
+          const browserAuth = await runtime.exchangeBrowserCookie(connection, upstreamUrl);
+          if (disposed) return;
           if (browserAuth.supported && browserAuth.cookie === null) {
             console.error('[dsh-passwords] dsh Web 一次性 token 交换失败，拒绝启动未认证网关；稍后重试');
             scheduleRetry();
             return;
           }
-          const childEnv = deploymentGatewayEnv(gatewayEnvFile, process.env);
-          const nextCfg = loadConfig({ env: childEnv });
+          const childEnv = runtime.deploymentEnv(gatewayEnvFile, process.env);
+          const nextCfg = runtime.loadConfig({ env: childEnv });
           const drift = gatewayConfigDrift(cfg, nextCfg);
           if (drift.length > 0) {
             handleConfigDrift(drift);
             return;
           }
           driftRetries = 0;
+          // 越过所有 await 后再确认一次：dispose 期间绝不能再拉起子进程或启动轮询。
+          if (disposed) return;
           const gatewayArgs = explicitUpstream !== ''
             ? [cliPath, 'serve-gateway']
             : [cliPath, 'serve-gateway', '--upstream', upstreamUrl];
-          child = spawn(process.execPath, gatewayArgs, {
+          const proc = runtime.spawn(process.execPath, gatewayArgs, {
             cwd: installRoot,
             env: {
               ...childEnv,
@@ -858,15 +900,21 @@ function startGateway(ctx: Context, cfg: PlatformConfig, explicitUpstream: strin
             },
             stdio: ['ignore', 'inherit', 'inherit'],
           });
+          child = proc;
           if (browserAuth.cookie !== null) startCookiePolling();
-          child.on('error', (error) => {
+          // spawn 失败（EACCES/ENOENT 等）会先发 error；Node 文档明确 exit 可能不再触发，
+          // 所以必须在这里交出所有权，否则下一次 launch 会被残留的 child 永久挡住。
+          proc.on('error', (error) => {
+            if (child !== proc) return; // 已有更新的子进程：迟到 error 不得夺回所有权
+            child = null;
             if (poll !== null) { clearInterval(poll); poll = null; }
             console.error('[dsh-passwords] 密码门拉起失败:', error);
             scheduleRetry();
           });
-          child.on('exit', (code, signal) => {
-            if (poll !== null) { clearInterval(poll); poll = null; }
+          proc.on('exit', (code, signal) => {
+            if (child !== proc) return; // 旧子进程迟到的 exit：不得清掉或驱动当前子进程
             child = null;
+            if (poll !== null) { clearInterval(poll); poll = null; }
             if (disposed) return;
             const reason = code ?? signal ?? 'unknown';
             if (reason === EXIT_CERT_FAILED) {
@@ -893,11 +941,12 @@ function startGateway(ctx: Context, cfg: PlatformConfig, explicitUpstream: strin
         if (retryTimer !== null) clearTimeout(retryTimer);
         if (driftTimer !== null) clearTimeout(driftTimer);
         if (poll !== null) clearInterval(poll);
-        if (child !== null && child.exitCode === null && child.signalCode === null) {
-          child.kill('SIGTERM');
+        const running = child;
+        if (running !== null && holdsLiveGatewayChild(running)) {
+          running.kill('SIGTERM');
           const force = setTimeout(() => {
-            if (child !== null && child.exitCode === null) {
-              try { child.kill('SIGKILL'); } catch { /* 已退出 */ }
+            if (running.exitCode === null) {
+              try { running.kill('SIGKILL'); } catch { /* 已退出 */ }
             }
           }, 3000);
           force.unref();
