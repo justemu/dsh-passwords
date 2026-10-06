@@ -1595,6 +1595,13 @@ export function createGatewayServer(
     : new http.Agent({ keepAlive: true, maxSockets: 64, keepAliveMsecs: 30_000 });
 
   type AssignableResources = { folders: Set<string>; sessions: Set<string> };
+  /** Internal probe budget: keeps the historical 10s default; large-corpus deployments
+   *  can override it with MCP_GATEWAY_INTERNAL_PROBE_TIMEOUT_MS. When left unset, the
+   *  behavior is identical to upstream (10s timeout → null → 502 RESOURCES_UNAVAILABLE). */
+  const internalProbeTimeoutMs = (): number => {
+    const raw = Number(String(process.env.MCP_GATEWAY_INTERNAL_PROBE_TIMEOUT_MS ?? '').trim());
+    return Number.isFinite(raw) && raw >= 1_000 && raw <= 600_000 ? raw : 10_000;
+  };
   const fetchAssignableResources = (): Promise<AssignableResources | null> => new Promise((resolve) => {
     const request = upstreamTransport.request({
       hostname: upstreamHost,
@@ -1607,7 +1614,7 @@ export function createGatewayServer(
         ...(upstreamAuthCookie === '' ? {} : { cookie: upstreamAuthCookie }),
       },
       agent: upstreamAgent,
-      timeout: 10_000,
+      timeout: internalProbeTimeoutMs(),
     }, (response) => {
       const chunks: Buffer[] = [];
       let size = 0;

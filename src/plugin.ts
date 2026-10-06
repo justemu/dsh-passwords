@@ -973,6 +973,19 @@ type AssignableSessionTitles = { get(session: unknown): { title?: string } | und
 type AssignableSessionQuery = {
   readSurface(id: string): Promise<{ events: readonly unknown[] }>;
   readTitle?(id: string): Promise<{ title?: string } | undefined>;
+  /**
+   * Batched title observation (readTitleSnapshots from dsh-session-query): one call
+   * drives the upstream internal concurrent worker pool through the persisted corpus,
+   * replacing per-id readTitle calls that each loaded and folded the full session log
+   * serially. Structurally matches SessionTitleObservationResult; any shape deviation
+   * falls back to per-id reads.
+   */
+  readTitleSnapshots?(ids: readonly string[]): Promise<readonly {
+    sessionId: string;
+    status: string;
+    value?: { title?: { title?: string } };
+    reason?: unknown;
+  }[]>;
   listEvents?(id: string): Promise<readonly { type: string }[]>;
 };
 
@@ -988,9 +1001,70 @@ export function isDefiniteMissingSession(error: unknown): boolean {
     (typeof message === 'string' && /session.*not found/i.test(message));
 }
 
+/** Bounded-concurrency map: preserves input order and avoids memory spikes from decompressing several large session logs at once. */
+async function mapBounded<T>(items: readonly T[], limit: number, fn: (item: T) => Promise<void>): Promise<void> {
+  if (items.length === 0) return;
+  let cursor = 0;
+  const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+    for (;;) {
+      const index = cursor;
+      if (index >= items.length) return;
+      cursor += 1;
+      await fn(items[index]);
+    }
+  });
+  await Promise.all(workers);
+}
+
+const normalizeTitle = (value: string | undefined): string | undefined =>
+  typeof value === 'string' && value.trim() !== '' ? value : undefined;
+
+/**
+ * Batched title read: prefer a single readTitleSnapshots call (upstream-internal
+ * concurrency), then fill in individually any ids it missed; if the method is absent
+ * or the whole batch throws, fall back entirely to per-id readTitle, matching the
+ * previous implementation.
+ */
+async function readAssignableTitles(
+  sessionQuery: AssignableSessionQuery,
+  ids: readonly string[],
+): Promise<Map<string, string | undefined>> {
+  const titles = new Map<string, string | undefined>();
+  if (ids.length === 0) return titles;
+  if (sessionQuery.readTitleSnapshots !== undefined) {
+    try {
+      const results = await sessionQuery.readTitleSnapshots(ids);
+      for (const result of results) {
+        if (result === null || typeof result !== 'object') continue;
+        const sessionId = typeof result.sessionId === 'string' ? result.sessionId : '';
+        if (sessionId === '') continue;
+        titles.set(sessionId, result.status === 'fulfilled' ? normalizeTitle(result.value?.title?.title) : undefined);
+      }
+      for (const id of ids) {
+        if (titles.has(id)) continue;
+        titles.set(id, normalizeTitle((await sessionQuery.readTitle?.(id))?.title));
+      }
+      return titles;
+    } catch {
+      titles.clear();
+    }
+  }
+  for (const id of ids) {
+    titles.set(id, normalizeTitle((await sessionQuery.readTitle?.(id))?.title));
+  }
+  return titles;
+}
+
 /**
  * DSH-owned assignment inventory. Live blank sessions remain assignable after
  * session.create(); only persisted, untitled initialization-only slots are hidden.
+ *
+ * Performance contract: persisted sessions get exactly one batched title read, and any
+ * session with a non-empty title never calls readSurface. The previous implementation
+ * serially called readSurface + readTitle for every session (each a full log load +
+ * fold), so a large session corpus dragged /workspaces and internal/assignable-resources
+ * into minutes and tripped the gateway's 60s response-header timeout (504) and its 10s
+ * internal probe timeout (502).
  */
 export async function listAssignableWorkspaces(
   reg: AssignableWorkspaceRegistry,
@@ -998,47 +1072,116 @@ export async function listAssignableWorkspaces(
   sessionTitle: AssignableSessionTitles | undefined,
   sessionQuery: AssignableSessionQuery | undefined,
 ): Promise<AssignableWorkspace[]> {
+  const query = sessionQuery;
   const archived = new Set(reg.archivedSessionIds.map((id) => String(id)));
-  const output: AssignableWorkspace[] = [];
+
+  // Stage 1: synchronous placeholder assembly — live sessions take their title in place; persisted sessions only register their id.
+  const stages: Array<{ path: string; title: string; slots: Array<{ id: string; title?: string }> }> = [];
+  const pending: string[] = [];
+  const pendingSeen = new Set<string>();
   for (const workspace of reg.list()) {
     if (await workspace.status() !== 'ok') continue;
-    const entries: Array<{ id: string; title: string }> = [];
+    const slots: Array<{ id: string; title?: string }> = [];
     for (const rawId of workspace.sessionIds) {
       const id = String(rawId);
       if (archived.has(id)) continue;
       const live = sessions?.get(id);
       if (live !== undefined) {
-        entries.push({ id, title: sessionTitle?.get(live)?.title || id });
+        slots.push({ id, title: sessionTitle?.get(live)?.title || id });
         continue;
       }
-      if (sessionQuery === undefined) throw new Error('session query unavailable');
-      try {
-        const surface = await sessionQuery.readSurface(id);
-        const title = await sessionQuery.readTitle?.(id);
-        if (!title?.title?.trim() && surface.events.length === 0 && sessionQuery.listEvents) {
-          const events = await sessionQuery.listEvents(id);
-          if (events.length > 0 && events.every((event) => INITIAL_SESSION_EVENT_TYPES.has(event.type))) continue;
-        }
-        entries.push({ id, title: title?.title || id });
-      } catch (error) {
-        if (isDefiniteMissingSession(error)) continue;
-        throw error;
+      if (query === undefined) throw new Error('session query unavailable');
+      slots.push({ id });
+      if (!pendingSeen.has(id)) {
+        pendingSeen.add(id);
+        pending.push(id);
       }
     }
-    output.push({ path: workspace.path, title: workspace.title, sessions: entries });
+    stages.push({ path: workspace.path, title: workspace.title, slots });
+  }
+
+  // Stage 2: one batched title observation; sessions that already got a title are done here and never read their full log.
+  const titles = query === undefined ? new Map<string, string | undefined>() : await readAssignableTitles(query, pending);
+
+  // Stage 3: only untitled sessions need readSurface/listEvents, to detect initialization-only empty slots.
+  const untitled = pending.filter((id) => titles.get(id) === undefined);
+  const hidden = new Set<string>();
+  if (query !== undefined && untitled.length > 0) {
+    await mapBounded(untitled, 3, async (id) => {
+      try {
+        const surface = await query.readSurface(id);
+        if (surface.events.length === 0 && query.listEvents) {
+          const events = await query.listEvents(id);
+          if (events.length > 0 && events.every((event) => INITIAL_SESSION_EVENT_TYPES.has(event.type))) {
+            hidden.add(id);
+          }
+        }
+      } catch (error) {
+        if (isDefiniteMissingSession(error)) {
+          hidden.add(id);
+          return;
+        }
+        throw error;
+      }
+    });
+  }
+
+  // Stage 4: emit in the original order; semantics match the previous implementation.
+  const output: AssignableWorkspace[] = [];
+  for (const stage of stages) {
+    const entries: Array<{ id: string; title: string }> = [];
+    for (const slot of stage.slots) {
+      if (hidden.has(slot.id)) continue;
+      entries.push({ id: slot.id, title: slot.title ?? titles.get(slot.id) ?? slot.id });
+    }
+    output.push({ path: stage.path, title: stage.title, sessions: entries });
   }
   return output;
+}
+
+/**
+ * Inventory TTL cache: the enumeration above reads the session corpus (measured at
+ * 40-90s on large corpora), while /workspaces (UI dropdown) and
+ * internal/assignable-resources (gateway save validation) are semantically identical
+ * and both are read-heavy / write-rare. With MCP_DSH_PASSWORDS_INVENTORY_TTL_MS > 0,
+ * hits are served straight from memory; 0 (the default) preserves upstream behavior —
+ * no caching, recomputed on every call. What is cached is the assignable inventory,
+ * not authorization data: authorization decisions still run on every request in
+ * admin.ts, so up to 60s of directory staleness only delays granting a freshly created
+ * session — it never relaxes an existing grant.
+ */
+let assignableInventoryCache: { at: number; workspaces: AssignableWorkspace[] } | null = null;
+export function resetAssignableInventoryCache(): void {
+  assignableInventoryCache = null;
+}
+async function loadAssignableInventory(
+  reg: AssignableWorkspaceRegistry,
+  sessions: AssignableSessions | undefined,
+  sessionTitle: AssignableSessionTitles | undefined,
+  sessionQuery: AssignableSessionQuery | undefined,
+  ttlMs: number,
+): Promise<AssignableWorkspace[]> {
+  if (ttlMs > 0 && assignableInventoryCache !== null && Date.now() - assignableInventoryCache.at < ttlMs) {
+    return assignableInventoryCache.workspaces;
+  }
+  const workspaces = await listAssignableWorkspaces(reg, sessions, sessionTitle, sessionQuery);
+  if (ttlMs > 0) assignableInventoryCache = { at: Date.now(), workspaces };
+  return workspaces;
 }
 
 export function apply(ctx: Context): void {
   let cfg: PlatformConfig;
   let explicitUpstream: string;
+  /** Assignable inventory TTL cache (ms); 0 = no caching (upstream default behavior) */
+  let inventoryTtlMs = 0;
   try {
     const installRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
     const envFile = process.env.DSH_PASSWORDS_ENV_FILE?.trim() || path.join(installRoot, '.env');
     const gatewayEnv = deploymentGatewayEnv(envFile, process.env);
     cfg = loadConfig({ env: gatewayEnv });
     explicitUpstream = gatewayEnv.MCP_GATEWAY_UPSTREAM?.trim() ?? '';
+    const rawTtl = Number(String(gatewayEnv.MCP_DSH_PASSWORDS_INVENTORY_TTL_MS ?? '0').trim());
+    inventoryTtlMs = Number.isFinite(rawTtl) && rawTtl > 0 ? rawTtl : 0;
   } catch (error) {
     // 配置损坏/缺失：记录日志而不是静默返回（否则 dsh 侧无任何提示，排查困难）
     console.error('[dsh-passwords] 加载配置失败，插件未激活:', error);
@@ -1505,7 +1648,8 @@ export function apply(ctx: Context): void {
           const sessions = ctx.get('sessions') as unknown as AssignableSessions | undefined;
           const sessionTitle = ctx.get('sessionTitle') as unknown as AssignableSessionTitles | undefined;
           const sessionQuery = ctx.get('sessionQuery') as unknown as AssignableSessionQuery | undefined;
-          writeJson(res, 200, { ok: true, workspaces: await listAssignableWorkspaces(registry, sessions, sessionTitle, sessionQuery) });
+          const workspaces = await loadAssignableInventory(registry, sessions, sessionTitle, sessionQuery, inventoryTtlMs);
+          writeJson(res, 200, { ok: true, workspaces });
         } catch (error) {
           writeJson(res, 502, {
             ok: false,
@@ -1530,7 +1674,7 @@ export function apply(ctx: Context): void {
           const sessions = ctx.get('sessions') as unknown as AssignableSessions | undefined;
           const sessionTitle = ctx.get('sessionTitle') as unknown as AssignableSessionTitles | undefined;
           const sessionQuery = ctx.get('sessionQuery') as unknown as AssignableSessionQuery | undefined;
-          const workspaces = await listAssignableWorkspaces(registry, sessions, sessionTitle, sessionQuery);
+          const workspaces = await loadAssignableInventory(registry, sessions, sessionTitle, sessionQuery, inventoryTtlMs);
           writeJson(res, 200, {
             ok: true,
             folders: workspaces.map((workspace) => workspace.path),
