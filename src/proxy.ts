@@ -217,6 +217,11 @@ export function sendMuxFrameBounded(
  * + 10 项 get/set/bump 访问器（被迁代码会读写的可变 let）。全部来自 gateway.ts 的
  * createGatewayServer 闭包或其导入项——本模块自身不复制任何授权状态。
  */
+export function upstreamResponseHeaderTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = Number(env.MCP_GATEWAY_UPSTREAM_HEADER_TIMEOUT_MS ?? '');
+  return Number.isFinite(raw) && raw >= 1 && raw <= 600_000 ? raw : 60_000;
+}
+
 export interface ProxyDeps {
   db: Database;
   auth: AuthService;
@@ -644,16 +649,7 @@ export function registerProxyRoutes(app: Application, deps: ProxyDeps): ProxyRou
   /** 安全过滤分支专属：解压超限时 fail-closed（502），不得透传未过滤内容 */
   class OversizeResponseError extends Error {}
 
-  /** 等待上游响应头的默认上限：请求体写尽后上游既不回响应头也不断开时，客户端不应永久挂起 */
-  const UPSTREAM_RESPONSE_HEADER_TIMEOUT_MS = 60_000;
-  /**
-   * 响应头等待上限（毫秒）。按请求读取环境变量，便于自动化测试把窗口压到毫秒级
-   * （与 MCP_GATEWAY_UPSTREAM_TLS_VERIFY 同口径）；非法值回落到默认上限，保证窗口有界。
-   */
-  function upstreamResponseHeaderTimeoutMs(): number {
-    const raw = Number(process.env.MCP_GATEWAY_UPSTREAM_HEADER_TIMEOUT_MS ?? '');
-    return Number.isFinite(raw) && raw > 0 ? raw : UPSTREAM_RESPONSE_HEADER_TIMEOUT_MS;
-  }
+
 
   /**
    * 有界解压：用 zlib 的 maxOutputLength 在分配内存前限制输出——事后 body.length 检查

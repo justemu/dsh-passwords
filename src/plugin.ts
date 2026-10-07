@@ -1017,7 +1017,7 @@ async function mapBounded<T>(items: readonly T[], limit: number, fn: (item: T) =
 }
 
 const normalizeTitle = (value: string | undefined): string | undefined =>
-  typeof value === 'string' && value.trim() !== '' ? value : undefined;
+  typeof value === 'string' && value !== '' ? value : undefined;
 
 /**
  * Batched title read: prefer a single readTitleSnapshots call (upstream-internal
@@ -1028,31 +1028,53 @@ const normalizeTitle = (value: string | undefined): string | undefined =>
 async function readAssignableTitles(
   sessionQuery: AssignableSessionQuery,
   ids: readonly string[],
-): Promise<Map<string, string | undefined>> {
+): Promise<{ titles: Map<string, string | undefined>; missing: Set<string> }> {
   const titles = new Map<string, string | undefined>();
-  if (ids.length === 0) return titles;
-  if (sessionQuery.readTitleSnapshots !== undefined) {
+  const missing = new Set<string>();
+  const readOneTitle = async (id: string): Promise<string | undefined> => {
     try {
-      const results = await sessionQuery.readTitleSnapshots(ids);
+      return normalizeTitle((await sessionQuery.readTitle?.(id))?.title);
+    } catch (error) {
+      if (isDefiniteMissingSession(error)) {
+        missing.add(id);
+        return undefined;
+      }
+      throw error;
+    }
+  };
+  if (ids.length === 0) return { titles, missing };
+  if (sessionQuery.readTitleSnapshots !== undefined) {
+    let results: Awaited<ReturnType<NonNullable<AssignableSessionQuery['readTitleSnapshots']>>> | undefined;
+    try {
+      results = await sessionQuery.readTitleSnapshots(ids);
+    } catch {
+      results = undefined;
+    }
+    if (results !== undefined) {
       for (const result of results) {
         if (result === null || typeof result !== 'object') continue;
         const sessionId = typeof result.sessionId === 'string' ? result.sessionId : '';
         if (sessionId === '') continue;
-        titles.set(sessionId, result.status === 'fulfilled' ? normalizeTitle(result.value?.title?.title) : undefined);
+        if (result.status === 'fulfilled') {
+          titles.set(sessionId, normalizeTitle(result.value?.title?.title));
+        } else if (isDefiniteMissingSession(result.reason)) {
+          titles.set(sessionId, undefined);
+          missing.add(sessionId);
+        } else {
+          throw result.reason;
+        }
       }
       for (const id of ids) {
         if (titles.has(id)) continue;
-        titles.set(id, normalizeTitle((await sessionQuery.readTitle?.(id))?.title));
+        titles.set(id, await readOneTitle(id));
       }
-      return titles;
-    } catch {
-      titles.clear();
+      return { titles, missing };
     }
   }
   for (const id of ids) {
-    titles.set(id, normalizeTitle((await sessionQuery.readTitle?.(id))?.title));
+    titles.set(id, await readOneTitle(id));
   }
-  return titles;
+  return { titles, missing };
 }
 
 /**
@@ -1101,11 +1123,13 @@ export async function listAssignableWorkspaces(
   }
 
   // Stage 2: one batched title observation; sessions that already got a title are done here and never read their full log.
-  const titles = query === undefined ? new Map<string, string | undefined>() : await readAssignableTitles(query, pending);
+  const titleResult = query === undefined
+    ? { titles: new Map<string, string | undefined>(), missing: new Set<string>() }
+    : await readAssignableTitles(query, pending);
 
   // Stage 3: only untitled sessions need readSurface/listEvents, to detect initialization-only empty slots.
-  const untitled = pending.filter((id) => titles.get(id) === undefined);
-  const hidden = new Set<string>();
+  const untitled = pending.filter((id) => !titleResult.titles.get(id)?.trim() && !titleResult.missing.has(id));
+  const hidden = new Set(titleResult.missing);
   if (query !== undefined && untitled.length > 0) {
     await mapBounded(untitled, 3, async (id) => {
       try {
@@ -1132,7 +1156,7 @@ export async function listAssignableWorkspaces(
     const entries: Array<{ id: string; title: string }> = [];
     for (const slot of stage.slots) {
       if (hidden.has(slot.id)) continue;
-      entries.push({ id: slot.id, title: slot.title ?? titles.get(slot.id) ?? slot.id });
+      entries.push({ id: slot.id, title: slot.title ?? titleResult.titles.get(slot.id) ?? slot.id });
     }
     output.push({ path: stage.path, title: stage.title, sessions: entries });
   }
@@ -1150,23 +1174,29 @@ export async function listAssignableWorkspaces(
  * admin.ts, so up to 60s of directory staleness only delays granting a freshly created
  * session — it never relaxes an existing grant.
  */
-let assignableInventoryCache: { at: number; workspaces: AssignableWorkspace[] } | null = null;
-export function resetAssignableInventoryCache(): void {
-  assignableInventoryCache = null;
-}
-async function loadAssignableInventory(
+export function createAssignableInventoryLoader(ttlMs: number): (
   reg: AssignableWorkspaceRegistry,
   sessions: AssignableSessions | undefined,
   sessionTitle: AssignableSessionTitles | undefined,
   sessionQuery: AssignableSessionQuery | undefined,
-  ttlMs: number,
-): Promise<AssignableWorkspace[]> {
-  if (ttlMs > 0 && assignableInventoryCache !== null && Date.now() - assignableInventoryCache.at < ttlMs) {
-    return assignableInventoryCache.workspaces;
-  }
-  const workspaces = await listAssignableWorkspaces(reg, sessions, sessionTitle, sessionQuery);
-  if (ttlMs > 0) assignableInventoryCache = { at: Date.now(), workspaces };
-  return workspaces;
+) => Promise<AssignableWorkspace[]> {
+  let cached: { at: number; workspaces: AssignableWorkspace[] } | null = null;
+  let pending: Promise<AssignableWorkspace[]> | null = null;
+
+  return async (reg, sessions, sessionTitle, sessionQuery) => {
+    if (ttlMs <= 0) return listAssignableWorkspaces(reg, sessions, sessionTitle, sessionQuery);
+    if (cached !== null && Date.now() - cached.at < ttlMs) return cached.workspaces;
+    if (pending !== null) return pending;
+
+    pending = listAssignableWorkspaces(reg, sessions, sessionTitle, sessionQuery);
+    try {
+      const workspaces = await pending;
+      cached = { at: Date.now(), workspaces };
+      return workspaces;
+    } finally {
+      pending = null;
+    }
+  };
 }
 
 export function apply(ctx: Context): void {
@@ -1181,12 +1211,13 @@ export function apply(ctx: Context): void {
     cfg = loadConfig({ env: gatewayEnv });
     explicitUpstream = gatewayEnv.MCP_GATEWAY_UPSTREAM?.trim() ?? '';
     const rawTtl = Number(String(gatewayEnv.MCP_DSH_PASSWORDS_INVENTORY_TTL_MS ?? '0').trim());
-    inventoryTtlMs = Number.isFinite(rawTtl) && rawTtl > 0 ? rawTtl : 0;
+    inventoryTtlMs = Number.isFinite(rawTtl) && rawTtl > 0 && rawTtl <= 600_000 ? rawTtl : 0;
   } catch (error) {
     // 配置损坏/缺失：记录日志而不是静默返回（否则 dsh 侧无任何提示，排查困难）
     console.error('[dsh-passwords] 加载配置失败，插件未激活:', error);
     return;
   }
+  const loadAssignableInventory = createAssignableInventoryLoader(inventoryTtlMs);
 
   // 未配置 .env（SETUP_KEY 为空）时不初始化数据库，用户管理路由返回 503 提示
   const configured =
@@ -1648,7 +1679,7 @@ export function apply(ctx: Context): void {
           const sessions = ctx.get('sessions') as unknown as AssignableSessions | undefined;
           const sessionTitle = ctx.get('sessionTitle') as unknown as AssignableSessionTitles | undefined;
           const sessionQuery = ctx.get('sessionQuery') as unknown as AssignableSessionQuery | undefined;
-          const workspaces = await loadAssignableInventory(registry, sessions, sessionTitle, sessionQuery, inventoryTtlMs);
+          const workspaces = await loadAssignableInventory(registry, sessions, sessionTitle, sessionQuery);
           writeJson(res, 200, { ok: true, workspaces });
         } catch (error) {
           writeJson(res, 502, {
@@ -1674,7 +1705,7 @@ export function apply(ctx: Context): void {
           const sessions = ctx.get('sessions') as unknown as AssignableSessions | undefined;
           const sessionTitle = ctx.get('sessionTitle') as unknown as AssignableSessionTitles | undefined;
           const sessionQuery = ctx.get('sessionQuery') as unknown as AssignableSessionQuery | undefined;
-          const workspaces = await loadAssignableInventory(registry, sessions, sessionTitle, sessionQuery, inventoryTtlMs);
+          const workspaces = await loadAssignableInventory(registry, sessions, sessionTitle, sessionQuery);
           writeJson(res, 200, {
             ok: true,
             folders: workspaces.map((workspace) => workspace.path),
