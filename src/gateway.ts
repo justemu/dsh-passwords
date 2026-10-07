@@ -30,6 +30,11 @@ export function requestBodyLimitFor(role: 'admin' | 'user', allowLargeBody: bool
   return role === 'admin' || allowLargeBody ? ADMIN_REQUEST_BODY_BYTES : DEFAULT_USER_REQUEST_BODY_BYTES;
 }
 
+export function internalProbeTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = Number(String(env.MCP_GATEWAY_INTERNAL_PROBE_TIMEOUT_MS ?? '').trim());
+  return Number.isFinite(raw) && raw >= 1_000 && raw <= 600_000 ? raw : 10_000;
+}
+
 const WebSocket = require('ws') as {
   OPEN: number;
   WebSocket: new (url: string, options?: {
@@ -1595,6 +1600,7 @@ export function createGatewayServer(
     : new http.Agent({ keepAlive: true, maxSockets: 64, keepAliveMsecs: 30_000 });
 
   type AssignableResources = { folders: Set<string>; sessions: Set<string> };
+
   const fetchAssignableResources = (): Promise<AssignableResources | null> => new Promise((resolve) => {
     const request = upstreamTransport.request({
       hostname: upstreamHost,
@@ -1607,7 +1613,7 @@ export function createGatewayServer(
         ...(upstreamAuthCookie === '' ? {} : { cookie: upstreamAuthCookie }),
       },
       agent: upstreamAgent,
-      timeout: 10_000,
+      timeout: internalProbeTimeoutMs(),
     }, (response) => {
       const chunks: Buffer[] = [];
       let size = 0;

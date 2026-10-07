@@ -29,6 +29,7 @@ const { WebSocketServer, WebSocket: NodeWebSocket } = require('ws') as {
 };
 
 import { createGatewayServer, requestBodyLimitFor, DEFAULT_USER_REQUEST_BODY_BYTES, ADMIN_REQUEST_BODY_BYTES } from '../src/gateway.js';
+import { upstreamResponseHeaderTimeoutMs } from '../src/proxy.js';
 import { AuthService } from '../src/auth.js';
 import { Database } from '../src/db.js';
 import { createFieldCrypto } from '../src/encrypt.js';
@@ -5837,6 +5838,15 @@ function withUpstreamResponseHeaderTimeoutMs<T>(value: string, run: () => Promis
     else process.env.MCP_GATEWAY_UPSTREAM_HEADER_TIMEOUT_MS = previous;
   });
 }
+
+test('upstream response header timeout accepts bounded integer values and otherwise uses the default', () => {
+  assert.equal(upstreamResponseHeaderTimeoutMs({}), 60_000);
+  assert.equal(upstreamResponseHeaderTimeoutMs({ MCP_GATEWAY_UPSTREAM_HEADER_TIMEOUT_MS: '1' }), 1);
+  assert.equal(upstreamResponseHeaderTimeoutMs({ MCP_GATEWAY_UPSTREAM_HEADER_TIMEOUT_MS: '600000' }), 600_000);
+  for (const value of ['0', '-1', '0.5', '600001', 'invalid']) {
+    assert.equal(upstreamResponseHeaderTimeoutMs({ MCP_GATEWAY_UPSTREAM_HEADER_TIMEOUT_MS: value }), 60_000, value);
+  }
+});
 
 test('上游响应头超时：接受请求后不回响应头时，网关有界返回 504 并中止上游请求', async () => {
   holdResponseHeaders = true;

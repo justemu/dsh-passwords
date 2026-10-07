@@ -1,6 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { isPermanentGatewayExitCode, listAssignableWorkspaces } from '../src/plugin.js';
+import {
+  createAssignableInventoryLoader,
+  isPermanentGatewayExitCode,
+  listAssignableWorkspaces,
+} from '../src/plugin.js';
 
 test('gateway permanent exit codes do not accept signal strings', () => {
   assert.equal(isPermanentGatewayExitCode(1), true);
@@ -126,4 +130,163 @@ test('Issue #25: non-missing session storage failures are propagated', async () 
     ),
     failure,
   );
+});
+
+test('Issue #39: batched titles preserve order and skip surface reads for titled sessions', async () => {
+  let observedIds: readonly string[] = [];
+  const surfaceCalls: string[] = [];
+  const result = await listAssignableWorkspaces(
+    registry(workspace(['titled', 'untitled'])),
+    { get: () => undefined },
+    undefined,
+    {
+      readTitleSnapshots: async (ids) => {
+        observedIds = ids;
+        return ids.map((sessionId) => ({
+          sessionId,
+          status: 'fulfilled',
+          value: { title: { title: sessionId === 'titled' ? 'Title' : '' } },
+        }));
+      },
+      readTitle: async () => { throw new Error('batch result should be used'); },
+      readSurface: async (id) => { surfaceCalls.push(id); return { events: [{ type: 'user/message' }] }; },
+      listEvents: async () => [{ type: 'user/message' }],
+    },
+  );
+
+  assert.deepEqual(observedIds, ['titled', 'untitled']);
+  assert.deepEqual(surfaceCalls, ['untitled']);
+  assert.deepEqual(result[0]?.sessions, [
+    { id: 'titled', title: 'Title' },
+    { id: 'untitled', title: 'untitled' },
+  ]);
+});
+
+test('Issue #39: batch misses fall back per id and definite missing sessions remain omitted', async () => {
+  const missing = Object.assign(new Error('session not found'), { code: 'SESSION_QUERY_SESSION_NOT_FOUND' });
+  const readTitleCalls: string[] = [];
+  const surfaceCalls: string[] = [];
+  const result = await listAssignableWorkspaces(
+    registry(workspace(['batch-hit', 'batch-miss', 'deleted'])),
+    { get: () => undefined },
+    undefined,
+    {
+      readTitleSnapshots: async () => [{
+        sessionId: 'batch-hit', status: 'fulfilled', value: { title: { title: 'Batch title' } },
+      }],
+      readTitle: async (id) => {
+        readTitleCalls.push(id);
+        if (id === 'deleted') throw missing;
+        return { title: 'Fallback title' };
+      },
+      readSurface: async (id) => { surfaceCalls.push(id); return { events: [{ type: 'user/message' }] }; },
+      listEvents: async () => [{ type: 'user/message' }],
+    },
+  );
+
+  assert.deepEqual(readTitleCalls, ['batch-miss', 'deleted']);
+  assert.deepEqual(surfaceCalls, [], 'a fallback title avoids the surface read');
+  assert.deepEqual(result[0]?.sessions, [
+    { id: 'batch-hit', title: 'Batch title' },
+    { id: 'batch-miss', title: 'Fallback title' },
+  ]);
+});
+
+test('Issue #39: missing sessions in legacy title fallback are omitted; other title errors propagate', async () => {
+  const missing = Object.assign(new Error('session not found'), { code: 'SESSION_QUERY_SESSION_NOT_FOUND' });
+  const result = await listAssignableWorkspaces(
+    registry(workspace(['missing', 'present'])),
+    { get: () => undefined },
+    undefined,
+    {
+      readTitle: async (id) => { if (id === 'missing') throw missing; return { title: 'Present' }; },
+      readSurface: async (id) => {
+        if (id === 'missing') throw missing;
+        return { events: [{ type: 'user/message', id }] };
+      },
+    },
+  );
+  assert.deepEqual(result[0]?.sessions, [{ id: 'present', title: 'Present' }]);
+
+  const failure = new Error('storage unavailable');
+  await assert.rejects(
+    listAssignableWorkspaces(
+      registry(workspace(['broken'])), { get: () => undefined }, undefined,
+      { readTitle: async () => { throw failure; }, readSurface: async () => ({ events: [] }) },
+    ),
+    failure,
+  );
+});
+
+test('Issue #39: rejected batch results propagate non-missing errors', async () => {
+  const failure = new Error('snapshot storage unavailable');
+  await assert.rejects(
+    listAssignableWorkspaces(
+      registry(workspace(['broken'])), { get: () => undefined }, undefined,
+      {
+        readTitleSnapshots: async () => [{ sessionId: 'broken', status: 'rejected', reason: failure }],
+        readSurface: async () => ({ events: [] }),
+      },
+    ),
+    failure,
+  );
+});
+
+test('Issue #39: inventory TTL is opt-in, scoped per loader, and coalesces concurrent misses', async () => {
+  let now = 10_000;
+  const originalNow = Date.now;
+  Date.now = () => now;
+  let reads = 0;
+  let noCacheReads = 0;
+  const reg = registry(workspace(['cached']));
+  let resolveTitle: ((value: { title: string }) => void) | undefined;
+  let markTitleStarted: (() => void) | undefined;
+  const titleStarted = new Promise<void>((resolve) => { markTitleStarted = resolve; });
+  const query = {
+    readTitle: async () => {
+      reads += 1;
+      markTitleStarted?.();
+      return await new Promise<{ title: string }>((resolve) => { resolveTitle = resolve; });
+    },
+    readSurface: async () => ({ events: [{ type: 'user/message' }] }),
+  };
+  try {
+    const noCache = createAssignableInventoryLoader(0);
+    const plainQuery = {
+      readTitle: async () => { noCacheReads += 1; return { title: 'cached' }; },
+      readSurface: query.readSurface,
+    };
+    await noCache(reg, { get: () => undefined }, undefined, plainQuery);
+    await noCache(reg, { get: () => undefined }, undefined, plainQuery);
+    assert.equal(noCacheReads, 2, 'TTL 0 recomputes for every request');
+    assert.equal(reads, 0);
+
+    const loader = createAssignableInventoryLoader(100);
+    const first = loader(reg, { get: () => undefined }, undefined, query);
+    const second = loader(reg, { get: () => undefined }, undefined, query);
+    await titleStarted;
+    assert.equal(reads, 1, 'concurrent cold requests share one enumeration');
+    resolveTitle?.({ title: 'cached title' });
+    await Promise.all([first, second]);
+    await loader(reg, { get: () => undefined }, undefined, query);
+    assert.equal(reads, 1, 'warm requests use the instance cache');
+
+    const otherInstance = createAssignableInventoryLoader(100);
+    let otherReads = 0;
+    await otherInstance(reg, { get: () => undefined }, undefined, {
+      readTitle: async () => { otherReads += 1; return { title: 'other' }; },
+      readSurface: query.readSurface,
+    });
+    assert.equal(otherReads, 1, 'separate plugin instances do not share cached data');
+
+    now += 101;
+    const expired = loader(reg, { get: () => undefined }, undefined, {
+      readTitle: async () => { reads += 1; return { title: 'expired' }; },
+      readSurface: query.readSurface,
+    });
+    await expired;
+    assert.equal(reads, 2, 'expired entries are recomputed');
+  } finally {
+    Date.now = originalNow;
+  }
 });
